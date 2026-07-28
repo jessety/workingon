@@ -1,6 +1,6 @@
 # Build Stage
 
-FROM node:18-alpine AS builder
+FROM node:24-alpine AS builder
 
 # cd into working directory
 WORKDIR /usr/src/app
@@ -21,11 +21,11 @@ RUN rm build/.tsbuildinfo
 
 # Remove all development dependencies and install only dependencies required to run in production
 RUN rm -rf node_modules
-RUN --mount=type=secret,id=npm,target=/root/.npmrc npm ci --production --ignore-scripts
+RUN --mount=type=secret,id=npm,target=/root/.npmrc npm ci --omit=dev --ignore-scripts
 
 # Production stage
 
-FROM node:18-alpine as base
+FROM node:24-alpine AS base
 
 # cd into working directory
 WORKDIR /usr/src/app
@@ -59,4 +59,4 @@ COPY .env* ./
 EXPOSE 8080
 
 # Start the service, exposing the node process directly to Kubernetes
-CMD [ "node", "--experimental-specifier-resolution=node", "--enable-source-maps", "build/index.js" ]
+CMD [ "node", "--enable-source-maps", "build/index.js" ]

@@ -1,6 +1,0 @@
-{
-  "extends": "@jessety",
-  "rules": {
-    "linebreak-style": ["warn", "unix"]
-  }
-}

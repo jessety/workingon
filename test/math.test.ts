@@ -1,4 +1,4 @@
-import { add, multiply } from '../src/math';
+import { add, multiply } from '../src/math.js';
 
 describe('math functions', () => {
   test('adds two numbers', () => {

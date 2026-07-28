@@ -4,6 +4,8 @@ Boilerplate for a TypeScript Node service
 
 [![ci](https://github.com/jessety/boilerplate-typescript-service/workflows/ci/badge.svg)](https://github.com/jessety/boilerplate-typescript-service/actions/workflows/ci.yml)
 
+Requires Node 20.19 or later.
+
 ## Includes
 
 - TypeScript configuration
@@ -12,10 +14,18 @@ Boilerplate for a TypeScript Node service
 - Prettier and ESLint for deterministic code formatting
 - CI - build, lint & test
 - GitHub Releases generated with automatic changelogs populated via a configurable template
-- Dependabot configuration
+- Dependabot configuration for both npm and GitHub Actions
 - VSCode settings
-- Modern JS compilation target (native modules)
+- Modern JS compilation target (native ES modules)
 - PM2 ecosystem file
+
+## Modules
+
+The project compiles to native ES modules with TypeScript's `NodeNext` module resolution, which means **relative imports must include a file extension**, and that extension is `.js` even in TypeScript source:
+
+```ts
+import { add } from './math.js';
+```
 
 ## Release
 

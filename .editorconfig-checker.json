@@ -4,6 +4,7 @@
     "node_modules",
     "coverage/",
     "build/",
+    "\\.husky/_/",
     "\\.DS_Store$",
     ".eslintcache"
   ]
