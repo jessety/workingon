@@ -1,6 +1,6 @@
 {
   "name": "@jessety/workingon",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "private": false,
   "description": "Receives Claude Code hooks, summarizes your activity with the Anthropic API, and publishes it as your SoWork text status.",
   "keywords": [
