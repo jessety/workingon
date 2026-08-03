@@ -1,6 +1,10 @@
-# Note: The production stage docker image only copies over the compiled code, package.json and .env files
-# This ignore file is only here to optimize the build stage
+# The production stage only copies compiled code, package.json, and the
+# `.env.defaults` / `.env.types` files. Everything else is build-stage only.
 node_modules
 coverage
 build
 test
+
+# Never let real secrets into the build context
+.env
+.env.local

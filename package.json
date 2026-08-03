@@ -1,15 +1,23 @@
 {
-  "name": "boilerplate-typescript-service",
+  "name": "@jessety/workingon",
   "version": "0.0.1",
-  "private": true,
-  "description": "",
-  "homepage": "https://github.com/jessety/boilerplate-typescript-service#readme",
+  "private": false,
+  "description": "Receives Claude Code hooks, summarizes your activity with the Anthropic API, and publishes it as your SoWork text status.",
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "sowork",
+    "anthropic",
+    "presence",
+    "status"
+  ],
+  "homepage": "https://github.com/jessety/workingon#readme",
   "bugs": {
-    "url": "https://github.com/jessety/boilerplate-typescript-service/issues"
+    "url": "https://github.com/jessety/workingon/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jessety/boilerplate-typescript-service.git"
+    "url": "git+https://github.com/jessety/workingon.git"
   },
   "license": "MIT",
   "author": "Jesse Youngblood",
@@ -23,8 +31,8 @@
     "build": "npm run clean && tsc",
     "build:start": "npm run build && npm run start",
     "clean": "rimraf build",
-    "docker:build": "docker build -t jessety/boilerplate-typescript-service .",
-    "docker:start": "docker run -p 8080:8080 --add-host=host.docker.internal:host-gateway -d jessety/boilerplate-typescript-service",
+    "docker:build": "docker build -t jessety/workingon .",
+    "docker:start": "docker run -p 127.0.0.1:8220:8220 --env-file .env -d jessety/workingon",
     "format": "sort-package-json && prettier --write '**/*.{ts,js,mjs,cjs,json,yml,md}' && eslint --fix --cache .",
     "lint": "eslint --cache . && ec .",
     "prepare": "husky",
@@ -32,12 +40,18 @@
     "release:minor": "npm version minor --no-commit-hooks && git push --follow-tags",
     "release:patch": "npm version patch --no-commit-hooks && git push --follow-tags",
     "start": "node build/index.js",
+    "start:pm2": "pm2 start ./ecosystem.config.json",
     "start:watch": "nodemon",
     "test": "jest",
     "test:watch": "jest --watchAll"
   },
   "overrides": {
     "brace-expansion": "^5.0.8"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "env-smart": "^2.3.2",
+    "sowork": "^0.3.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -60,6 +74,6 @@
     "typescript-eslint": "^8.65.0"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22"
   }
 }

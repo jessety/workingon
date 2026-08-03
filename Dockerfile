@@ -52,11 +52,17 @@ COPY --from=builder /usr/src/app/build/ build/
 # Copy the production node_modules from the first stage
 COPY --from=builder /usr/src/app/node_modules/ node_modules/
 
-# Copy over all configuration files we need to run
-COPY .env* ./
+# Copy over the defaults and type definitions env-smart applies at runtime.
+# `.env` itself is deliberately NOT copied — baking secrets into the image is
+# a bad idea. Pass them in at run time with `--env-file .env`.
+COPY .env.defaults .env.types ./
+
+# Inside the container the server must bind all interfaces for `-p` port publishing
+# to reach it; outside Docker the default is loopback (see .env.defaults)
+ENV HOST=0.0.0.0
 
 # Expose the port
-EXPOSE 8080
+EXPOSE 8220
 
 # Start the service, exposing the node process directly to Kubernetes
 CMD [ "node", "--enable-source-maps", "build/index.js" ]

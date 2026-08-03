@@ -1,13 +1,13 @@
 {
   "apps": [
     {
-      "name": "service",
+      "name": "workingon",
       "namespace": "default",
 
       "cwd": "./",
       "script": "build/index.js",
 
-      "watch": true,
+      "watch": false,
       "ignore_watch": [".git", "node_modules", "src", "**/.DS_Store"]
     }
   ]

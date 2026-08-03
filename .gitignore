@@ -3,6 +3,13 @@ coverage
 build
 .eslintcache
 
+# Real secrets live here. `.env.defaults` and `.env.types` are committed.
+.env
+.env.local
+
+# Runtime logs — these quote prompt text
+*.log
+
 **/.DS_Store
 **/.Spotlight-V100
 **/[Tt]humbs.db
