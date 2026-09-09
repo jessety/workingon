@@ -1,6 +1,8 @@
+import type { ActivityEvent } from './activity/events.js';
 import { type ActivityStore } from './activity/store.js';
 import { INPUTS, type Input } from './inputs/index.js';
 import { describeError, log } from './logger.js';
+import type { SessionSink } from './npcs/types.js';
 import crypto from 'node:crypto';
 import http from 'node:http';
 
@@ -14,6 +16,8 @@ export interface ServerOptions {
   store: ActivityStore;
   /** Describes the most recent status push, for the /status endpoint */
   describeStatus: () => unknown;
+  /** Independent in-memory lifecycle sink; absent when NPC mode is disabled. */
+  sessions?: SessionSink;
 }
 
 function sendJson(
@@ -83,6 +87,7 @@ async function handleHook(
   response: http.ServerResponse,
   store: ActivityStore,
   input: Input,
+  sessions: SessionSink | undefined,
 ): Promise<void> {
   const raw = await readBody(request);
 
@@ -105,9 +110,33 @@ async function handleHook(
   }
 
   const body = parsed as { hook_event_name: string };
-  const event = input.normalize(body, Date.now());
+  const now = Date.now();
+  let event: ActivityEvent | undefined;
+  try {
+    event = input.normalize(body, now);
+  } catch {
+    log.warn(
+      `[${input.name}] Could not normalize hook activity; accepting delivery without recording its content`,
+    );
+  }
+  let sessionRecorded = false;
+  if (sessions !== undefined) {
+    try {
+      const signal = input.normalizeSession(body, now);
+      if (signal !== undefined) {
+        sessionRecorded = sessions.observe(signal);
+      }
+    } catch {
+      // An optional companion must never break the person's coding session.
+      log.warn(`[${input.name}] Could not record NPC lifecycle signal`);
+    }
+  }
 
   if (event === undefined) {
+    if (sessionRecorded) {
+      sendJson(response, 200, { recorded: true });
+      return;
+    }
     // An event we don't record, or one we subscribe to but couldn't read.
     // The second case is a bug or a field rename, so log the payload's field
     // names — not their values — to make it diagnosable. Either way this is not
@@ -135,7 +164,7 @@ async function handleHook(
 }
 
 export function createServer(options: ServerOptions): http.Server {
-  const { token, store, describeStatus } = options;
+  const { token, store, describeStatus, sessions } = options;
 
   // path -> input, e.g. /hooks and /hooks/claude -> claude, /hooks/codex -> codex
   const inputsByPath = new Map<string, Input>();
@@ -173,6 +202,7 @@ export function createServer(options: ServerOptions): http.Server {
                 ? null
                 : new Date(store.lastActivityAt).toISOString(),
             status: describeStatus(),
+            ...(sessions === undefined ? {} : { npcs: sessions.describe() }),
           });
           return;
         }
@@ -186,7 +216,7 @@ export function createServer(options: ServerOptions): http.Server {
             sendJson(response, 401, { error: 'Unauthorized' });
             return;
           }
-          await handleHook(request, response, store, input);
+          await handleHook(request, response, store, input, sessions);
           return;
         }
 

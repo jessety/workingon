@@ -1,4 +1,5 @@
 import { ActivityStore } from '../src/activity/store.js';
+import type { SessionSink } from '../src/npcs/types.js';
 import { createServer } from '../src/server.js';
 import type http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -216,5 +217,70 @@ describe('authentication disabled', () => {
     expect(openStore.size).toBe(1);
 
     await close(openServer);
+  });
+});
+
+describe('optional NPC lifecycle lane', () => {
+  async function withNpcs(
+    sessions: SessionSink,
+    run: () => Promise<void>,
+  ): Promise<void> {
+    await close(server);
+    server = createServer({
+      port: 0,
+      token: TOKEN,
+      store,
+      sessions,
+      describeStatus: () => ({ personal: 'Existing status' }),
+    });
+    await listen(server);
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    await run();
+  }
+
+  test('accepts a textless lifecycle event without adding noise to the personal digest', async () => {
+    const observe = jest.fn(() => true);
+    await withNpcs(
+      { observe, describe: () => ({ enabled: true }) },
+      async () => {
+        const response = await post('/hooks/codex', {
+          hook_event_name: 'Stop',
+          session_id: 's1',
+          last_assistant_message: null,
+        });
+        await expect(response.json()).resolves.toEqual({ recorded: true });
+        expect(observe).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'stop', source: 'codex' }),
+        );
+        expect(store.size).toBe(0);
+        const status = await fetch(`${origin}/status`, {
+          headers: { authorization: `Bearer ${TOKEN}` },
+        });
+        await expect(status.json()).resolves.toMatchObject({
+          status: { personal: 'Existing status' },
+          npcs: { enabled: true },
+        });
+      },
+    );
+  });
+
+  test('a failed NPC sink cannot fail a hook or lose personal activity', async () => {
+    await withNpcs(
+      {
+        observe: () => {
+          throw new Error('NPC unavailable');
+        },
+        describe: () => null,
+      },
+      async () => {
+        const response = await post('/hooks', {
+          hook_event_name: 'UserPromptSubmit',
+          session_id: 's1',
+          prompt: 'A request',
+        });
+        expect(response.status).toBe(200);
+        expect(store.size).toBe(1);
+      },
+    );
   });
 });

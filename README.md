@@ -14,6 +14,8 @@ OpenAI Codex ─┘           (in-memory)                 (summarize)  └──
 
 Requires Node 22 or later.
 
+Optional **NPC companions** give every observed main Claude Code or Codex session its own SoWork character, alongside your existing personal status. They follow you, show current activity, speak at key moments, and hide between sessions. Start with the [NPC setup guide](docs/npcs.md). The feature defaults to off (`NPC_ENABLED=FALSE`).
+
 ## Setup
 
 ```bash
@@ -261,7 +263,7 @@ Summarizing means sending activity to the Anthropic API, so it's worth being pre
 
 Values that look like credentials — `sk-…`, `ghp_…`, `SOMETHING_TOKEN=…` — are redacted before anything is stored. That's a safety net for the obvious cases, not a guarantee; treat it as defense in depth rather than a reason to relax about what you paste into a prompt.
 
-Finally, the one-line summary itself goes to whichever of SoWork and Slack you configured, where your teammates can read it. Nothing is written to disk: activity lives in a fixed-size in-memory buffer and is gone when the process restarts.
+Finally, the one-line summary itself goes to whichever of SoWork and Slack you configured, where your teammates can read it. Activity lives in a fixed-size in-memory buffer and is gone when the process restarts. Optional NPC mode also sends session-specific descriptions and speech to SoWork, and writes a small ownership ledger containing hashed session keys, NPC IDs, allocation counters, timestamps, and recovery markers. Prompt text, project names, and generated prose are not persisted in that ledger. See [NPC storage and recovery](docs/npcs.md#storage-and-recovery).
 
 ## Configuration
 
@@ -290,6 +292,8 @@ Set these in `.env`. Defaults live in `.env.defaults`, and types in `.env.types`
 
 A quiet interval costs nothing: if no events arrived, no API call is made.
 
+NPC mode has its own [configuration and cadence](docs/npcs.md#configuration), independent of personal summaries. It also polls your SoWork presence every 30 seconds while enabled, even without new agent activity; quiet sessions do not incur NPC summary calls.
+
 ## Endpoints
 
 | Route         | Auth | Purpose                                         |
@@ -299,6 +303,8 @@ A quiet interval costs nothing: if no events arrived, no API call is made.
 | `GET /status` | Yes  | Buffered event count and the last status pushed |
 
 `POST /hooks` records the event and returns immediately — Claude Code blocks on the response, so nothing slow happens on that path. Unrecognized events return `200 {"recorded": false}` rather than an error, so a Claude Code upgrade that adds new events can never break your session.
+
+With NPC mode enabled, a lifecycle-only event can return `recorded:true` without increasing the personal activity buffer. `/status` gains an additive `npcs` section for companion state, errors, and queue diagnostics. The existing personal `status` object is unchanged.
 
 ## Running it for real
 

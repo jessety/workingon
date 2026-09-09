@@ -1,0 +1,122 @@
+import type { ActivitySource } from '../activity/events.js';
+
+export type SessionKind =
+  | 'start'
+  | 'prompt'
+  | 'tool-start'
+  | 'tool-end'
+  | 'question'
+  | 'permission'
+  | 'stop'
+  | 'interrupted'
+  | 'failed'
+  | 'end';
+
+/** Sanitized input only. Identity fields are hashes, never transcript paths. */
+export interface SessionSignal {
+  key: string;
+  source: ActivitySource;
+  project: string;
+  at: number;
+  kind: SessionKind;
+  actor?: string;
+  turn?: string;
+  tool?: string;
+  toolName?: string;
+  startReason?: string;
+  detail: string;
+  voice: 'person' | 'agent';
+}
+
+export interface SessionSink {
+  /** Synchronous, bounded memory work. Must never perform I/O. */
+  observe(signal: SessionSignal): boolean;
+  describe(): unknown;
+}
+
+export type SessionPhase =
+  | 'ready'
+  | 'working'
+  | 'waiting-input'
+  | 'waiting-permission'
+  | 'finished'
+  | 'interrupted'
+  | 'failed'
+  | 'ended';
+
+export interface NpcSummary {
+  task: string;
+  say: string | null;
+}
+
+export interface SessionSummarizer {
+  summarize(digest: string): Promise<NpcSummary | undefined>;
+}
+
+export type NpcLocation = { type: 'desk' } | { type: 'user'; userId: string };
+
+export interface Npc {
+  id: string;
+  ownerId: string;
+  name: string;
+  createdAt: number;
+}
+
+export interface NpcPatch {
+  name?: string;
+  visible?: boolean;
+  location?: NpcLocation;
+  textStatus?: string | null;
+  say?: { text: string } | null;
+}
+
+/** The SDK satisfies this slice structurally; tests supply an in-memory client. */
+export interface NpcClient {
+  me: {
+    getMe(): Promise<{
+      data: {
+        id: string;
+        name?: string;
+        presence: { availability: 'available' | 'busy' | 'away' | 'offline' };
+      };
+    }>;
+  };
+  npcs: {
+    createNpc(data: { name: string; visible: boolean }): Promise<{ data: Npc }>;
+    listNpcs(query?: { cursor?: string; limit?: number }): Promise<{
+      data: { npcs: Npc[]; nextCursor?: string };
+    }>;
+    getNpc(id: string): Promise<{ data: Npc }>;
+    updateNpc(id: string, patch: NpcPatch): Promise<unknown>;
+    deleteNpc(id: string): Promise<unknown>;
+  };
+}
+
+/** The ONLY per-session data written to disk. No prompts, projects, or prose. */
+export interface NpcRecord {
+  key: string;
+  source: ActivitySource;
+  number: number;
+  lastSeen: number;
+  hiddenAt?: number;
+  ended: boolean;
+  npcId?: string;
+  createName?: string;
+  creationAttempted?: boolean;
+  lastSpokeAt: number;
+}
+
+export interface NpcState {
+  version: 1;
+  installation: string;
+  account: string;
+  ownerId: string;
+  counters: Record<ActivitySource, number>;
+  records: NpcRecord[];
+}
+
+export interface NpcStateRepository {
+  open(): Promise<NpcState | undefined>;
+  save(state: NpcState): Promise<void>;
+  close(): Promise<void>;
+}

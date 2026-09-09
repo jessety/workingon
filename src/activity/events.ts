@@ -33,8 +33,8 @@ export interface ActivityEvent {
   /**
    * The agent's session id, or `unknown`.
    *
-   * Not currently read by anything — digests group on `project` — but retained
-   * for debugging and future per-session features. Never sent to any API.
+   * Personal digests group on `project`. NPC lifecycle input independently
+   * validates/hashes the same identity for per-session grouping. Never sent to any API.
    */
   session: string;
   /** Directory name of the session's cwd — the project being worked on */

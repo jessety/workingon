@@ -18,6 +18,14 @@ function configuration(overrides: Partial<Configuration> = {}): Configuration {
     planDirectory: '',
     planMaxAgeHours: 12,
     planContextChars: 400,
+    npcEnabled: false,
+    npcNamePrefix: '',
+    npcIdleMinutes: 10,
+    npcStaleMinutes: 120,
+    npcSummaryIntervalSeconds: 30,
+    npcSpeechCooldownSeconds: 60,
+    npcMaxSessions: 50,
+    npcStateFile: '/tmp/workingon-test-npcs.json',
     dryRun: false,
     verbose: false,
     ...overrides,
@@ -59,5 +67,45 @@ describe('validate', () => {
     expect(
       problems.some((problem) => problem.includes('ANTHROPIC_API_KEY')),
     ).toBe(true);
+  });
+
+  test('NPC mode needs SoWork credentials even when Slack is configured', () => {
+    expect(
+      validate(configuration({ npcEnabled: true, slackApiToken: 'xoxp-x' })),
+    ).toContain('NPC_ENABLED requires SOWORK_API_KEY (or DRY_RUN=TRUE)');
+  });
+
+  test('NPC dry run can operate without a SoWork key', () => {
+    expect(validate(configuration({ npcEnabled: true, dryRun: true }))).toEqual(
+      [],
+    );
+  });
+
+  test.each([NaN, Infinity, 0, -1])(
+    'rejects invalid NPC timing: %p',
+    (value) => {
+      expect(
+        validate(
+          configuration({
+            npcEnabled: true,
+            dryRun: true,
+            npcIdleMinutes: value,
+          }),
+        ).some((message) => message.startsWith('NPC_IDLE_MINUTES')),
+      ).toBe(true);
+    },
+  );
+
+  test('validates capacity, state path, and a stale timeout shorter than idle', () => {
+    const problems = validate(
+      configuration({
+        npcEnabled: true,
+        dryRun: true,
+        npcMaxSessions: 1.5,
+        npcStateFile: '',
+        npcStaleMinutes: 1,
+      }),
+    );
+    expect(problems).toHaveLength(3);
   });
 });

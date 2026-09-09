@@ -7,6 +7,9 @@ build
 .env
 .env.local
 
+# Optional repository-local NPC state (the default lives outside the repo).
+.workingon/
+
 # Runtime logs — these quote prompt text
 *.log
 

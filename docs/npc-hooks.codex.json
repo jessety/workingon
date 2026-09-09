@@ -1,0 +1,97 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/codex -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

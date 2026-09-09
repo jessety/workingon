@@ -1,0 +1,98 @@
+# NPC companions
+
+Optional companions give each observed main Claude Code or Codex session its own character in SoWork. Personal SoWork and Slack statuses continue on their existing schedule.
+
+Companions default to off. Enable them with `NPC_ENABLED=TRUE`.
+
+## Setup
+
+1. Install the updated dependencies with `npm ci`. The lockfile selects `sowork` 0.5.0, which exposes the NPC API.
+2. Set `NPC_ENABLED=TRUE` in `.env`. Live mode requires `SOWORK_API_KEY` and a role allowed to create characters. Your existing Anthropic key/model supplies the NPC descriptions.
+3. Install the additional hooks using [the Claude example](npc-hooks.claude.json) and [the Codex example](npc-hooks.codex.json).
+4. Start with `DRY_RUN=TRUE`. It simulates all NPC operations in memory, logs intended changes, and still calls Anthropic for prose. No SoWork client or live ownership file is used. Set `NPC_NAME_PREFIX=Jesse's` if you want that prefix in dry-run logs; without a live identity lookup the fallback is `My`.
+5. Once validated, switch `DRY_RUN=FALSE`, build, and restart your usual service.
+
+For an existing PM2 process, run these from the repository after editing `.env`:
+
+```bash
+npm run build
+pm2 restart workingon --update-env
+pm2 logs workingon
+```
+
+If the process is not registered yet, use `npm run start:pm2` instead of restarting it. PM2 runs `build/index.js` without watching source files, so changes require a build and restart. Send a fresh prompt to trigger an NPC; already-open conversations are not automatically enumerated.
+
+Merge hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, preserving unrelated handlers. Add a handler only where an event does not already forward to workingon. If it already does, replace that workingon handler with the example instead of installing both: `/hooks` and `/hooks/claude` are aliases, not separate inputs.
+
+The examples assume port 8220 and `WORKINGON_HOOK_TOKEN` exported into your agents' environment. It must match `HOOK_TOKEN` in this service's `.env`. Claude uses HTTP hooks except for `SessionStart`; Codex uses command hooks. Command hooks discard the HTTP response and return successfully even if the receiver is down. They never return approval or denial instructions to the coding agent.
+
+Validate hook support and actual field shapes on your installed builds before enabling office writes. The fixtures in the tests are synthetic, informed by the inspected schemas; they are not a substitute for capturing live shapes. Useful additional signals are `SessionStart`, `PreToolUse`, and `PermissionRequest`; Claude also supplies `PostToolUseFailure` and `StopFailure`, while Codex supplies `Interrupt`. Notification bodies and transcript files are not used.
+
+## What you should see
+
+Names use the owner's first name and separate counters: `Jesse's Codex 1`, `Jesse's Claude 1`, etc. They inherit your avatar when created. Names and numbers are stable for as long as that session's record is retained. Project names do not identify sessions: two agents in the same repository get different NPCs.
+
+An NPC starts as **Ready**, becomes **Working**, and reports **Needs permission**, **Waiting for your answer**, **Ready for review**, **Interrupted**, or **Encountered an error** when corresponding signals arrive. A completed response does not mean the underlying task succeeded. Tool failures are evidence about the attempted work, not terminal session failures.
+
+State changes are processed on a 250 ms worker pulse. Writes are coalesced, normally at most once every two seconds per NPC; lifecycle changes and bubble clearing bypass that throttle. Initial creation requires multiple requests because the NPC is created hidden and recorded before becoming visible. Network latency and retries can delay what appears in the office; hooks themselves do not wait for those requests.
+
+Natural-language task descriptions use only the corresponding session's sanitized activity. A new prompt clears its previous description until new prose arrives. Summaries run at most once every 30 seconds per session with new evidence, with two simultaneous requests. Steady activity arriving during a request does not invalidate it, but a new turn or lifecycle transition does. Failed batches advance their watermark and wait for new activity.
+
+Waiting and finished NPCs hide after 10 minutes. Working NPCs use a separate 120-minute silence timeout so a long command can keep its character around. A fresh prompt or tool start brings a hidden NPC back. A working session's delayed tool completion can also bring it back. `SessionEnd` deletes the NPC, retaining a short tombstone to reject late tools/stops; a new start or prompt can reopen the session. Hidden NPCs and tombstones expire after 24 hours.
+
+While you are online, the location is `{type: "user", userId: yourId}`. If your presence becomes `offline`, NPCs move to `{type: "desk"}`. Presence is polled once every 30 seconds for the whole group; `busy` and `away` remain online. A failed presence read retains the last known location. The integration delegates actual movement/rendering to SoWork's native location behavior.
+
+Short speech bubbles mark questions, review availability, and meaningful milestones. They are limited to one per NPC per minute and one across the group every 10 seconds. Pending speech expires after 30 seconds instead of becoming a backlog. Bubbles are cleared after 10 seconds or when their lifecycle context changes. An ambiguous speech write is consumed rather than replayed.
+
+## Configuration
+
+| Variable                       | Default                              | Meaning                                                                   |
+| ------------------------------ | ------------------------------------ | ------------------------------------------------------------------------- |
+| `NPC_ENABLED`                  | `FALSE`                              | Enable companions alongside personal statuses                             |
+| `NPC_NAME_PREFIX`              | empty                                | Derive a possessive first name; fallback `My`                             |
+| `NPC_IDLE_MINUTES`             | `10`                                 | Hide waiting, ready, interrupted, or finished sessions                    |
+| `NPC_STALE_MINUTES`            | `120`                                | Hide working sessions with no hooks; must be at least the idle timeout    |
+| `NPC_SUMMARY_INTERVAL_SECONDS` | `30`                                 | Minimum interval between summary attempts for a session                   |
+| `NPC_SPEECH_COOLDOWN_SECONDS`  | `60`                                 | Minimum interval between speech attempts for a session                    |
+| `NPC_MAX_SESSIONS`             | `50`                                 | Bound tracked sessions, including retained hidden sessions and tombstones |
+| `NPC_STATE_FILE`               | `~/.local/state/workingon/npcs.json` | Durable ownership metadata; keep it across restarts                       |
+
+Use one service instance per office/API identity and state file. A second writer to the same file is refused. If capacity is reached, new sessions are dropped from the NPC lane and counted in diagnostics; the personal activity lane continues. Raise the limit if your daily session turnover needs more retained records.
+
+## Storage and recovery
+
+Activity and generated prose remain in memory. The state file stores installation identity, a hash binding it to the endpoint/credential, owner ID, hashed session keys, allocated numbers, NPC IDs, timestamps, and pending creation markers. It contains no project names, prompts, tool output, descriptions, or speech. The file is written atomically with owner-only permissions. Dry runs do not read, lock, or write it.
+
+Before a create request, the service saves an intent with a unique temporary name. It creates that NPC with `visible:false`, saves the returned ID, and only then gives it its display name and makes it visible. If a request times out after the server may have accepted it, recovery scans every page of the NPC list for that exact marker and owner. It never adopts characters just because their visible names look like `Jesse's Codex 1`.
+
+If recovery finds no match after an ambiguous create, it continues searching periodically but **does not issue another create**. The API does not provide an idempotency key or a way to prove that an unanswered create never committed. This conservative case is exposed as `npc_create_uncertain_inspect_state`.
+
+On every launch, the service reads the persistent ledger and explicitly hides each recorded NPC, clearing its old status and speech after verifying ownership. A successful hide must precede reuse, even if fresh hooks arrive immediately or while the hide request is in flight. Failed hides retry with backoff; the affected NPC cannot be reused until hiding succeeds. `npcs.startupHidesPending` in `/status` reports remaining startup cleanup.
+
+Existing sessions appear on their next activity hook, reusing the saved ID and number; there is no enumeration of already-open conversations. Explicitly ended sessions reject late tool/stop deliveries. Old turn IDs and duplicate tool IDs are ignored where the hooks provide them; without correlation IDs, arrival order is the available evidence. Permission hooks without tool IDs are matched by actor and tool name, which cannot perfectly distinguish simultaneous requests for the same tool.
+
+Graceful shutdown attempts to hide recorded characters before releasing the file lock. The process retains its five-second shutdown deadline. The API exposes no NPC expiry: a hard kill, prolonged outage, or revoked credential can leave a visible NPC until the service recovers or you remove it manually.
+
+## Diagnostics and troubleshooting
+
+Authenticated `GET /status` includes `npcs`: initialization status, errors, presence state, active/hidden counts, dropped signals, pending/in-flight work, API/summary request counts, and each session's name, project, phase, NPC ID, latest state, and retry time. Visibility and status describe the desired state; pending writes or errors can mean the office has not caught up. The personal `status` object is unchanged. Warnings and errors are in PM2's `workingon-error.log`.
+
+| Diagnostic                                         | Action                                                                                                                          |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `ready:false` with a retryable error               | Check connectivity and the error log; initialization retries with backoff                                                       |
+| `npc_create_not_permitted` / `creationDenied:true` | Check the role's Create characters permission, then restart; existing NPC updates may continue                                  |
+| `not_npc_owner`                                    | Inspect the recorded ID and authenticated owner; the service refuses to mutate that character                                   |
+| `npc_state_belongs_to_another_api_identity`        | Restore the original endpoint/key or select another state file; changing credentials is not treated as proof of the same office |
+| `npc_state_unavailable_check_file_and_lock`        | Inspect the configured file and lock; preserve corrupt files for recovery                                                       |
+| `npc_state_write_failed`                           | Fix storage/permissions and restart; publishing pauses before further untracked changes                                         |
+| `npc_create_uncertain_inspect_state`               | Inspect the record's `createName` and the full SoWork NPC list; see below                                                       |
+| `npc_creation_conflict`                            | Multiple NPCs match one pending marker; inspect and resolve them manually                                                       |
+| Increasing `dropped`                               | Check session capacity and startup backlog                                                                                      |
+
+A normal stale lock is reclaimed only when its PID is confirmed dead. An incomplete lock, reused PID, or leftover `.recovering` guard requires manual inspection. Confirm no process is using the state file before removing a lock or recovery guard. Do not erase the ledger as a troubleshooting shortcut: it is what distinguishes this integration's NPCs from other characters.
+
+For unresolved creation, stop the service and preserve a copy of the ledger. Check every page of the office's NPC list for the exact `createName` and owner. If a matching NPC exists, keep the marker and restart so recovery can adopt it. If you have confirmed the request did not create a character, setting that record's `creationAttempted` to `false` permits a fresh attempt on resumed activity. Do not change that flag while a create request could still be in flight.
+
+To disable NPCs, first shut down the enabled service cleanly and confirm its characters are hidden, then set `NPC_ENABLED=FALSE` and restart. Keep the state file. Starting with NPC mode disabled does not perform recovery or cleanup from an earlier hard crash.
+
+API references: [NPC operations](https://api.sowork.com/public/documentation/reference/npcs.md), [OpenAPI schema](https://api.sowork.com/public/documentation/json), [Codex hooks](https://learn.chatgpt.com/docs/hooks), and [Claude hooks](https://code.claude.com/docs/en/hooks).
