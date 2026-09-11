@@ -14,7 +14,7 @@ OpenAI Codex ─┘           (in-memory)                 (summarize)  └──
 
 Requires Node 22 or later.
 
-Optional **NPC companions** give every observed main Claude Code or Codex session its own SoWork character, alongside your existing personal status. They follow you, show current activity, speak at key moments, and hide between sessions. Start with the [NPC setup guide](docs/npcs.md). The feature defaults to off (`NPC_ENABLED=FALSE`).
+Optional **NPC companions** give every observed main Claude Code or Codex session its own SoWork character, alongside your existing personal status. They work at your desk, follow you when waiting for an answer or permission, make a 30-second “Ready for review” visit when a response completes, and hide after inactivity. One reusable pool serves your user across agents and repositories. Start with the [NPC setup guide](docs/npcs.md). The feature defaults to off (`NPC_ENABLED=FALSE`).
 
 ## Setup
 

@@ -1,4 +1,9 @@
-import type { NpcRecord, NpcState, NpcStateRepository } from './types.js';
+import type {
+  NpcRecord,
+  NpcSlot,
+  NpcState,
+  NpcStateRepository,
+} from './types.js';
 import { randomUUID } from 'node:crypto';
 import { open, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
@@ -43,68 +48,91 @@ function string(value: unknown, pattern?: RegExp): string {
   return value;
 }
 
+export class LegacyNpcStateError extends Error {
+  constructor() {
+    super(
+      'NPC state version 1 requires an explicit ownership-verified reset; preserve the file',
+    );
+  }
+}
+
 /** Rebuild the allowlisted shape, rather than trusting/copying arbitrary JSON. */
 export function parseNpcState(value: unknown): NpcState {
   const state = object(value);
+  if (state.version === 1) {
+    throw new LegacyNpcStateError();
+  }
   if (
-    state.version !== 1 ||
+    state.version !== 2 ||
     !Array.isArray(state.records) ||
-    state.records.length > 10_000
+    state.records.length > 1000 ||
+    !Array.isArray(state.sessions) ||
+    state.sessions.length > 10_000
   ) {
     throw new Error(
       'Unsupported or oversized NPC state; preserve the file for recovery',
     );
   }
   const installation = string(state.installation, UUID);
-  const counters = object(state.counters);
+  const counter = number(state.counter);
   const seenKeys = new Set<string>();
-  const seenIds = new Set<string>();
-  const seenNumbers = new Set<string>();
-  const seenNames = new Set<string>();
-  const records = state.records.map((value): NpcRecord => {
+  const sessions = state.sessions.map((value): NpcRecord => {
     const row = object(value);
     const key = string(row.key, HASH);
     if (
       (row.source !== 'claude' && row.source !== 'codex') ||
-      typeof row.ended !== 'boolean'
+      typeof row.ended !== 'boolean' ||
+      seenKeys.has(key)
     ) {
-      throw new Error('NPC state contains an invalid session');
-    }
-    const ordinal = number(row.number);
-    const allocation = `${row.source}:${ordinal}`;
-    if (
-      ordinal < 1 ||
-      ordinal > number(counters[row.source]) ||
-      seenKeys.has(key) ||
-      seenNumbers.has(allocation)
-    ) {
-      throw new Error(
-        'NPC state contains duplicate or inconsistent allocations',
-      );
+      throw new Error('NPC state contains an invalid or duplicate session');
     }
     seenKeys.add(key);
-    seenNumbers.add(allocation);
     const result: NpcRecord = {
       key,
       source: row.source,
-      number: ordinal,
       ended: row.ended,
       lastSeen: timestamp(row.lastSeen),
-      lastSpokeAt: timestamp(row.lastSpokeAt),
     };
     if (row.hiddenAt !== undefined) {
       result.hiddenAt = timestamp(row.hiddenAt);
     }
+    return result;
+  });
+  const seenIds = new Set<string>();
+  const seenNumbers = new Set<number>();
+  const seenNames = new Set<string>();
+  const assigned = new Set<string>();
+  const records = state.records.map((value): NpcSlot => {
+    const row = object(value);
+    const ordinal = number(row.number);
+    if (ordinal < 1 || ordinal > counter || seenNumbers.has(ordinal)) {
+      throw new Error(
+        'NPC state contains duplicate or inconsistent allocations',
+      );
+    }
+    seenNumbers.add(ordinal);
+    const result: NpcSlot = {
+      number: ordinal,
+      lastSpokeAt: timestamp(row.lastSpokeAt),
+    };
+    if (row.sessionKey !== undefined) {
+      const key = string(row.sessionKey, HASH);
+      if (!seenKeys.has(key) || assigned.has(key)) {
+        throw new Error('NPC state contains an invalid or duplicate lease');
+      }
+      assigned.add(key);
+      result.sessionKey = key;
+    }
     if (row.npcId !== undefined) {
       result.npcId = string(row.npcId, NPC_ID);
       if (seenIds.has(result.npcId)) {
-        throw new Error('NPC state assigns one NPC to multiple sessions');
+        throw new Error('NPC state assigns one NPC to multiple slots');
       }
       seenIds.add(result.npcId);
     }
     if (row.createName !== undefined) {
       result.createName = string(row.createName);
-      const prefix = `workingon-${installation.replaceAll('-', '').slice(0, 12)}-${row.source}-`;
+      const prefix = `workingon-${installation.replaceAll('-', '').slice(0, 12)}-pool-`;
       if (
         !result.createName.startsWith(prefix) ||
         !/^[a-f0-9]{20}$/.test(result.createName.slice(prefix.length)) ||
@@ -122,15 +150,13 @@ export function parseNpcState(value: unknown): NpcState {
     return result;
   });
   return {
-    version: 1,
+    version: 2,
     installation,
     account: string(state.account, HASH),
     ownerId: string(state.ownerId),
-    counters: {
-      claude: number(counters.claude),
-      codex: number(counters.codex),
-    },
+    counter,
     records,
+    sessions,
   };
 }
 

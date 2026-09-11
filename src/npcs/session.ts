@@ -3,6 +3,7 @@ import type { ActivitySource } from '../activity/events.js';
 import { clean } from '../activity/sanitize.js';
 
 export const RETENTION_MS = 24 * 60 * 60_000;
+export const REVIEW_VISIT_MS = 30_000;
 const MAX_EVENTS = 100;
 
 const LABELS: Record<SessionPhase, string> = {
@@ -36,7 +37,11 @@ export class Session {
   summarizedThrough = 0;
   nextSummaryAt = 0;
   task = '';
-  pendingSpeech: { text: string; revision: number; at: number } | undefined;
+  reviewUntil: number | undefined;
+  pendingSpeech:
+    | { text: string; revision: number; at: number; review?: boolean }
+    | undefined;
+
   #basePhase: SessionPhase = 'ready';
   #idleSince: number;
   #turn: string | undefined;
@@ -234,16 +239,26 @@ export class Session {
       this.revision += 1;
       this.#idleSince = signal.at;
       this.pendingSpeech = undefined;
+      // One window per completed response. Duplicate Stop hooks cannot extend it.
+      this.reviewUntil =
+        this.phase === 'finished' && this.visible
+          ? signal.at + REVIEW_VISIT_MS
+          : undefined;
       const text =
         this.phase === 'waiting-input'
           ? 'I have a question when you have a moment'
           : this.phase === 'waiting-permission'
             ? 'I need permission to continue'
             : this.phase === 'finished'
-              ? 'My response is ready for review'
+              ? 'Ready for review'
               : undefined;
       if (text !== undefined && this.visible) {
-        this.pendingSpeech = { text, revision: this.revision, at: signal.at };
+        this.pendingSpeech = {
+          text,
+          revision: this.revision,
+          at: signal.at,
+          ...(this.phase === 'finished' ? { review: true } : {}),
+        };
       }
     }
     return true;
@@ -254,6 +269,7 @@ export class Session {
     const timeout = this.phase === 'working' ? staleMs : idleMs;
     if (this.visible && now - last >= timeout) {
       this.hiddenAt = now;
+      this.reviewUntil = undefined;
       this.pendingSpeech = undefined;
       this.revision += 1;
     }
@@ -261,6 +277,8 @@ export class Session {
       this.pendingSpeech !== undefined &&
       (this.pendingSpeech.revision !== this.revision ||
         now - this.pendingSpeech.at > 30_000 ||
+        (this.pendingSpeech.review === true &&
+          now >= (this.reviewUntil ?? 0)) ||
         !this.visible)
     ) {
       this.pendingSpeech = undefined;
@@ -269,6 +287,7 @@ export class Session {
 
   hide(now: number): void {
     this.hiddenAt ??= now;
+    this.reviewUntil = undefined;
     this.pendingSpeech = undefined;
     this.revision += 1;
   }

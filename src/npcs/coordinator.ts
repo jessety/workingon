@@ -2,11 +2,13 @@ import { clean } from '../activity/sanitize.js';
 import { log } from '../logger.js';
 import { NpcError, npcError } from './client.js';
 import { RETENTION_MS, Session } from './session.js';
+import { LegacyNpcStateError } from './state.js';
 import type {
   Npc,
   NpcClient,
   NpcPatch,
   NpcRecord,
+  NpcSlot,
   NpcState,
   NpcStateRepository,
   SessionSignal,
@@ -33,11 +35,13 @@ export interface NpcOptions {
 
 interface Entry {
   session: Session;
-  record: NpcRecord;
+  record: NpcSlot;
+  releasing: boolean;
   verifiedId?: string;
   startupHidePending: boolean;
   published?: string;
   publishedRevision?: number;
+  publishedLocation?: string;
   bubble?: { revision: number; expiresAt: number };
   mustClearSpeech: boolean;
   lastSpeech: string;
@@ -71,7 +75,9 @@ export class NpcCoordinator implements SessionSink {
   #fatal: string | undefined;
   #creationDenied = false;
   #pending: SessionSignal[] = [];
-  #entries = new Map<string, Entry>();
+  #entries = new Map<number, Entry>();
+  #leases = new Map<string, Entry>();
+  #sessions = new Map<string, { session: Session; record: NpcRecord }>();
   #dropped = 0;
   #reportedDropped = 0;
   #revision = 0;
@@ -128,49 +134,75 @@ export class NpcCoordinator implements SessionSink {
   }
 
   #record(signal: SessionSignal): boolean {
-    let entry = this.#entries.get(signal.key);
-    if (entry === undefined) {
-      // A helper arriving before its parent is observed cannot create an NPC.
+    let history = this.#sessions.get(signal.key);
+    if (history === undefined) {
+      // Helpers cannot create leases. History capacity is independent of pool size.
       if (signal.actor !== undefined || this.#state === undefined) {
         return false;
       }
-      if (this.#entries.size >= this.#options.maxSessions) {
-        this.#dropped += 1;
-        return false;
+      if (this.#sessions.size >= 10_000) {
+        const oldest = [...this.#sessions.values()]
+          .filter(
+            ({ session }) => !session.visible && !this.#assigned(session.key),
+          )
+          .sort((a, b) => a.session.lastSeen - b.session.lastSeen)[0];
+        if (oldest === undefined) {
+          this.#dropped += 1;
+          return false;
+        }
+        this.#removeHistory(oldest.session.key);
       }
-      const counter = this.#state.counters[signal.source];
-      if (!Number.isSafeInteger(counter + 1)) {
-        this.#fatal = 'npc_counter_exhausted';
-        return false;
-      }
-      this.#state.counters[signal.source] = counter + 1;
       const record: NpcRecord = {
         key: signal.key,
         source: signal.source,
-        number: counter + 1,
         lastSeen: signal.at,
         ended: false,
-        lastSpokeAt: 0,
       };
-      entry = this.#entry(
-        new Session(signal.key, signal.source, signal.at),
+      history = {
+        session: new Session(signal.key, signal.source, signal.at),
         record,
-      );
-      this.#entries.set(signal.key, entry);
-      this.#state.records.push(record);
+      };
+      this.#sessions.set(signal.key, history);
+      this.#state.sessions.push(record);
       this.#revision += 1;
     }
-    const recorded = entry.session.apply(signal);
+    const recorded = history.session.apply(signal);
     if (recorded) {
-      this.#sync(entry);
+      this.#sync(history);
+      // Latch release even if a new prompt arrives before the hide completes.
+      const entry = this.#assigned(signal.key);
+      if (entry !== undefined && !history.session.visible) {
+        entry.releasing = true;
+      }
     }
     return recorded;
   }
 
-  #entry(session: Session, record: NpcRecord): Entry {
+  #assigned(key: string): Entry | undefined {
+    return this.#leases.get(key);
+  }
+
+  #removeHistory(key: string): void {
+    this.#sessions.delete(key);
+    if (this.#state !== undefined) {
+      this.#state.sessions = this.#state.sessions.filter(
+        (record) => record.key !== key,
+      );
+    }
+    this.#revision += 1;
+  }
+
+  #idleSession(): Session {
+    const session = new Session('', 'codex', this.#now());
+    session.hide(this.#now());
+    return session;
+  }
+
+  #entry(session: Session, record: NpcSlot): Entry {
     return {
       session,
       record,
+      releasing: false,
       startupHidePending: false,
       mustClearSpeech: true,
       lastSpeech: '',
@@ -183,8 +215,7 @@ export class NpcCoordinator implements SessionSink {
     };
   }
 
-  #sync(entry: Entry): void {
-    const { session, record } = entry;
+  #sync({ session, record }: { session: Session; record: NpcRecord }): void {
     const ended = session.phase === 'ended';
     if (
       record.lastSeen !== session.lastSeen ||
@@ -194,6 +225,89 @@ export class NpcCoordinator implements SessionSink {
       record.lastSeen = session.lastSeen;
       record.hiddenAt = session.hiddenAt;
       record.ended = ended;
+      this.#revision += 1;
+    }
+  }
+
+  #release(entry: Entry): void {
+    if (entry.record.sessionKey !== undefined) {
+      this.#leases.delete(entry.record.sessionKey);
+    }
+    delete entry.record.sessionKey;
+    entry.session = this.#idleSession();
+    entry.releasing = false;
+    entry.startupHidePending = false;
+    entry.published = undefined;
+    entry.publishedRevision = undefined;
+    entry.bubble = undefined;
+    entry.mustClearSpeech = false;
+    entry.lastSpeech = '';
+    entry.lastSpeechRevision = -1;
+    entry.nextWriteAt = 0;
+    this.#revision += 1;
+  }
+
+  /** Reserve leases synchronously; no await can allocate the same slot twice. */
+  #allocate(): void {
+    if (this.#state === undefined || this.#stopping) {
+      return;
+    }
+    // All restored characters must be hidden before any new lease can appear.
+    if ([...this.#entries.values()].some((entry) => entry.startupHidePending)) {
+      return;
+    }
+    for (const { session } of this.#sessions.values()) {
+      if (!session.visible || this.#assigned(session.key) !== undefined) {
+        continue;
+      }
+      const entries = [...this.#entries.values()].sort(
+        (a, b) => a.record.number - b.record.number,
+      );
+      const assigned = entries.filter(
+        (entry) => entry.record.sessionKey !== undefined,
+      ).length;
+      if (assigned >= this.#options.maxSessions) {
+        break;
+      }
+      let entry = entries.find(
+        (candidate) =>
+          candidate.record.sessionKey === undefined &&
+          !candidate.releasing &&
+          !candidate.publishing &&
+          candidate.error === undefined &&
+          candidate.record.createName === undefined,
+      );
+      if (entry === undefined) {
+        // Recovery/release/uncertain POSTs reserve capacity, never trigger growth.
+        if (
+          entries.some(
+            (candidate) =>
+              candidate.releasing ||
+              !candidate.session.visible ||
+              candidate.record.createName !== undefined,
+          ) ||
+          entries.length >= this.#options.maxSessions
+        ) {
+          break;
+        }
+        if (!Number.isSafeInteger(this.#state.counter + 1)) {
+          this.#fatal = 'npc_counter_exhausted';
+          return;
+        }
+        const record: NpcSlot = {
+          number: ++this.#state.counter,
+          lastSpokeAt: 0,
+        };
+        entry = this.#entry(this.#idleSession(), record);
+        this.#entries.set(record.number, entry);
+        this.#state.records.push(record);
+      }
+      entry.session = session;
+      entry.record.sessionKey = session.key;
+      this.#leases.set(session.key, entry);
+      entry.mustClearSpeech = true;
+      entry.published = undefined;
+      entry.publishedRevision = undefined;
       this.#revision += 1;
     }
   }
@@ -265,8 +379,13 @@ export class NpcCoordinator implements SessionSink {
       try {
         this.#loaded = await this.#options.repository.open();
         this.#opened = true;
-      } catch {
-        throw new NpcError('npc_state_unavailable_check_file_and_lock', false);
+      } catch (error) {
+        throw new NpcError(
+          error instanceof LegacyNpcStateError
+            ? 'npc_legacy_state_requires_reset'
+            : 'npc_state_unavailable_check_file_and_lock',
+          false,
+        );
       }
     }
     if (this.#stopping) {
@@ -287,11 +406,12 @@ export class NpcCoordinator implements SessionSink {
     }
     const now = this.#now();
     this.#state = this.#loaded ?? {
-      version: 1,
+      version: 2,
       installation: randomUUID(),
       account: this.#options.account,
       ownerId: me.id,
-      counters: { claude: 0, codex: 0 },
+      counter: 0,
+      sessions: [],
       records: [],
     };
     this.#ownerOnline = me.presence.availability !== 'offline';
@@ -299,13 +419,19 @@ export class NpcCoordinator implements SessionSink {
     this.#namePrefix =
       clean(this.#options.namePrefix, 48) ||
       (firstName === '' ? 'My' : `${firstName}'s`);
+    for (const record of this.#state.sessions) {
+      const history = { session: Session.restore(record, now), record };
+      this.#sessions.set(record.key, history);
+      this.#sync(history);
+    }
     for (const record of this.#state.records) {
-      const session = Session.restore(record, now);
-      const entry = this.#entry(session, record);
+      // Previous leases never bypass startup recovery, even with fresh hooks.
+      delete record.sessionKey;
+      const entry = this.#entry(this.#idleSession(), record);
       entry.startupHidePending =
         record.npcId !== undefined || record.creationAttempted === true;
-      this.#entries.set(record.key, entry);
-      this.#sync(entry);
+      entry.releasing = entry.startupHidePending;
+      this.#entries.set(record.number, entry);
       this.#lastSpeechAt = Math.max(this.#lastSpeechAt, record.lastSpokeAt);
     }
     this.#revision += 1;
@@ -367,31 +493,37 @@ export class NpcCoordinator implements SessionSink {
     }
 
     const jobs: Promise<void>[] = [];
-    for (const [key, entry] of this.#entries) {
-      entry.session.expire(
+    for (const [key, history] of this.#sessions) {
+      const { session } = history;
+      session.expire(
         now,
         this.#options.idleMinutes * 60_000,
         this.#options.staleMinutes * 60_000,
       );
-      this.#sync(entry);
+      this.#sync(history);
+      const entry = this.#assigned(key);
+      if (entry !== undefined && !session.visible) {
+        entry.releasing = true;
+      }
       if (
+        entry === undefined &&
+        session.hiddenAt !== undefined &&
+        now - session.hiddenAt >= RETENTION_MS
+      ) {
+        this.#removeHistory(key);
+      }
+    }
+    for (const entry of this.#entries.values()) {
+      if (
+        entry.releasing &&
         !entry.publishing &&
-        !entry.summarizing &&
-        this.#retiring(entry, now) &&
-        entry.session.hiddenAt !== undefined &&
-        now - entry.session.hiddenAt >= RETENTION_MS &&
         entry.record.npcId === undefined &&
         entry.record.createName === undefined
       ) {
-        this.#entries.delete(key);
-        if (this.#state !== undefined) {
-          this.#state.records = this.#state.records.filter(
-            (record) => record.key !== key,
-          );
-        }
-        this.#revision += 1;
+        this.#release(entry);
       }
     }
+    this.#allocate();
     if (this.#dropped !== this.#reportedDropped) {
       log.warn(
         'NPC session/buffer capacity reached; some signals were dropped',
@@ -491,6 +623,8 @@ export class NpcCoordinator implements SessionSink {
       if (
         entry === undefined ||
         entry.summarizing ||
+        entry.releasing ||
+        entry.record.sessionKey === undefined ||
         !entry.session.visible ||
         entry.error !== undefined ||
         (this.#creationDenied && entry.record.npcId === undefined) ||
@@ -516,44 +650,52 @@ export class NpcCoordinator implements SessionSink {
   }
 
   #name(entry: Entry): string {
-    const suffix = `${entry.record.source === 'codex' ? 'Codex' : 'Claude'} ${entry.record.number}`;
+    const suffix = `${entry.session.source === 'codex' ? 'Codex' : 'Claude'} ${entry.record.number}`;
     return `${clean(this.#namePrefix, 63 - suffix.length)} ${suffix}`;
   }
 
   #visual(entry: Entry): NpcPatch {
-    const visible = entry.session.visible && !this.#stopping;
+    const visible =
+      entry.record.sessionKey !== undefined &&
+      !entry.releasing &&
+      entry.session.visible &&
+      !this.#stopping;
+    const waiting =
+      entry.session.phase === 'waiting-input' ||
+      entry.session.phase === 'waiting-permission';
+    const reviewing =
+      entry.session.phase === 'finished' &&
+      this.#now() < (entry.session.reviewUntil ?? 0);
     return {
       name: this.#name(entry),
       visible,
-      location: this.#ownerOnline
-        ? { type: 'user', userId: this.#state?.ownerId ?? '' }
-        : { type: 'desk' },
+      location:
+        visible && (waiting || reviewing) && this.#ownerOnline
+          ? { type: 'user', userId: this.#state?.ownerId ?? '' }
+          : { type: 'desk' },
       textStatus: visible ? entry.session.status : null,
     };
-  }
-
-  #retiring(entry: Entry, now: number): boolean {
-    return (
-      entry.session.phase === 'ended' ||
-      (entry.session.hiddenAt !== undefined &&
-        now - entry.session.hiddenAt >= RETENTION_MS)
-    );
   }
 
   #speechEligible(entry: Entry, now: number): boolean {
     const speech = entry.session.pendingSpeech;
     return (
       !this.#stopping &&
+      !entry.releasing &&
       entry.session.visible &&
       speech !== undefined &&
       speech.revision === entry.session.revision &&
       now - speech.at <= 30_000 &&
+      (speech.review !== true || now < (entry.session.reviewUntil ?? 0)) &&
       (speech.text !== entry.lastSpeech ||
         speech.revision !== entry.lastSpeechRevision) &&
-      (entry.record.lastSpokeAt === 0 ||
-        now - entry.record.lastSpokeAt >=
-          this.#options.speechCooldownSeconds * 1000) &&
-      (this.#lastSpeechAt === 0 || now - this.#lastSpeechAt >= 10_000)
+      // A review visit always announces its purpose once. Ordinary speech still
+      // obeys both cooldowns, including time reserved by review announcements.
+      (speech.review === true ||
+        ((entry.record.lastSpokeAt === 0 ||
+          now - entry.record.lastSpokeAt >=
+            this.#options.speechCooldownSeconds * 1000) &&
+          (this.#lastSpeechAt === 0 || now - this.#lastSpeechAt >= 10_000)))
     );
   }
 
@@ -574,8 +716,18 @@ export class NpcCoordinator implements SessionSink {
       now < entry.retryAt ||
       (now < entry.nextWriteAt &&
         entry.publishedRevision === entry.session.revision &&
+        entry.publishedLocation ===
+          JSON.stringify(this.#visual(entry).location) &&
         entry.session.visible &&
         !this.#clearBubble(entry, now))
+    ) {
+      return false;
+    }
+    if (
+      entry.record.sessionKey === undefined &&
+      !entry.releasing &&
+      !entry.startupHidePending &&
+      entry.record.createName === undefined
     ) {
       return false;
     }
@@ -583,12 +735,12 @@ export class NpcCoordinator implements SessionSink {
       return true;
     }
     if (entry.record.npcId === undefined) {
-      return entry.session.visible && !this.#creationDenied;
+      return !entry.releasing && entry.session.visible && !this.#creationDenied;
     }
     return (
       entry.startupHidePending ||
       entry.verifiedId !== entry.record.npcId ||
-      this.#retiring(entry, now) ||
+      entry.releasing ||
       entry.published !== JSON.stringify(this.#visual(entry)) ||
       this.#clearBubble(entry, now) ||
       this.#speechEligible(entry, now)
@@ -643,13 +795,14 @@ export class NpcCoordinator implements SessionSink {
     if (record.createName === undefined) {
       if (
         !entry.session.visible ||
+        entry.releasing ||
         this.#stopping ||
         this.#creationDenied ||
         this.#state === undefined
       ) {
         return;
       }
-      record.createName = `workingon-${this.#state.installation.replaceAll('-', '').slice(0, 12)}-${record.source}-${randomBytes(10).toString('hex')}`;
+      record.createName = `workingon-${this.#state.installation.replaceAll('-', '').slice(0, 12)}-pool-${randomBytes(10).toString('hex')}`;
       record.creationAttempted = false;
       this.#revision += 1;
     }
@@ -662,7 +815,7 @@ export class NpcCoordinator implements SessionSink {
         throw new NpcError('npc_create_uncertain_inspect_state', true, 60_000);
       }
     } else {
-      if (!entry.session.visible || this.#stopping) {
+      if (!entry.session.visible || entry.releasing || this.#stopping) {
         delete record.createName;
         delete record.creationAttempted;
         this.#revision += 1;
@@ -675,7 +828,7 @@ export class NpcCoordinator implements SessionSink {
       record.creationAttempted = true;
       this.#revision += 1;
       await this.#persist();
-      if (!entry.session.visible || this.#stopping) {
+      if (!entry.session.visible || entry.releasing || this.#stopping) {
         record.creationAttempted = false;
         this.#revision += 1;
         await this.#persist();
@@ -727,7 +880,6 @@ export class NpcCoordinator implements SessionSink {
   }
 
   async #publish(entry: Entry): Promise<void> {
-    this.#sync(entry);
     await this.#persist();
     await this.#ensureNpc(entry);
     const id = entry.record.npcId;
@@ -744,10 +896,12 @@ export class NpcCoordinator implements SessionSink {
       }
       entry.verifiedId = id;
     }
-    if (entry.startupHidePending) {
-      // Hooks may already have resumed this session. Its first write after a
-      // restart must still clear the previous process's visible state, and an
-      // acknowledged hide must precede any subsequent reuse of this NPC.
+    if (
+      entry.startupHidePending ||
+      entry.releasing ||
+      !entry.session.visible ||
+      this.#stopping
+    ) {
       await this.#request(() =>
         this.#options.client.npcs.updateNpc(id, {
           visible: false,
@@ -755,31 +909,8 @@ export class NpcCoordinator implements SessionSink {
           textStatus: null,
         }),
       );
-      entry.startupHidePending = false;
-      entry.published = undefined;
-      entry.publishedRevision = undefined;
-      entry.bubble = undefined;
-      entry.mustClearSpeech = false;
-      return;
-    }
-    if (this.#retiring(entry, this.#now())) {
-      await this.#request(() =>
-        this.#options.client.npcs.updateNpc(id, {
-          visible: false,
-          say: null,
-          textStatus: null,
-        }),
-      );
-      entry.published = undefined;
-      entry.publishedRevision = undefined;
-      entry.bubble = undefined;
-      entry.mustClearSpeech = false;
-      // A fresh prompt can arrive while hiding. Reuse that NPC if deletion has
-      // not begun; if it arrives during DELETE, recreate with the same number.
-      if (this.#retiring(entry, this.#now())) {
-        await this.#request(() => this.#options.client.npcs.deleteNpc(id));
-        await this.#forgetNpc(entry);
-      }
+      this.#release(entry);
+      await this.#persist();
       return;
     }
 
@@ -787,8 +918,8 @@ export class NpcCoordinator implements SessionSink {
       ? entry.session.pendingSpeech
       : undefined;
     if (speech !== undefined) {
-      // Reserve both cooldowns before awaiting, so parallel NPCs cannot chatter
-      // together. Ambiguous speech writes are consumed rather than replayed.
+      // Reserve both cooldowns before awaiting. Only deterministic review
+      // notices bypass them; ambiguous speech is consumed rather than replayed.
       this.#lastSpeechAt = this.#now();
       entry.record.lastSpokeAt = this.#lastSpeechAt;
       this.#revision += 1;
@@ -796,7 +927,10 @@ export class NpcCoordinator implements SessionSink {
       if (
         this.#stopping ||
         !entry.session.visible ||
+        entry.releasing ||
         speech.revision !== entry.session.revision ||
+        (speech.review === true &&
+          this.#now() >= (entry.session.reviewUntil ?? 0)) ||
         this.#now() - speech.at > 30_000
       ) {
         speech = undefined;
@@ -814,7 +948,10 @@ export class NpcCoordinator implements SessionSink {
       entry.lastSpeechRevision = speech.revision;
       entry.bubble = {
         revision: speech.revision,
-        expiresAt: this.#now() + 10_000,
+        expiresAt:
+          speech.review === true
+            ? (entry.session.reviewUntil ?? this.#now())
+            : this.#now() + 10_000,
       };
       entry.mustClearSpeech = false;
     } else if (this.#clearBubble(entry, this.#now()) || !visual.visible) {
@@ -823,6 +960,7 @@ export class NpcCoordinator implements SessionSink {
     await this.#request(() => this.#options.client.npcs.updateNpc(id, patch));
     entry.published = JSON.stringify(visual);
     entry.publishedRevision = revision;
+    entry.publishedLocation = JSON.stringify(visual.location);
     entry.nextWriteAt = this.#now() + 2000;
     if (patch.say === null) {
       entry.bubble = undefined;
@@ -879,6 +1017,8 @@ export class NpcCoordinator implements SessionSink {
       if (
         this.#stopping ||
         this.#fatal !== undefined ||
+        entry.session !== session ||
+        entry.releasing ||
         !session.visible ||
         session.revision !== revision
       ) {
@@ -888,6 +1028,7 @@ export class NpcCoordinator implements SessionSink {
       const say = result.say === null ? '' : clean(result.say, 120);
       if (
         say !== '' &&
+        session.phase !== 'finished' &&
         session.pendingSpeech === undefined &&
         say !== entry.lastSpeech
       ) {
@@ -927,23 +1068,63 @@ export class NpcCoordinator implements SessionSink {
       apiRequests: this.#requests,
       summaryRequests: this.#summaries,
       summaryFailures: this.#summaryFailures,
-      sessions: [...this.#entries.values()].map((entry) => ({
-        name: this.#name(entry),
-        source: entry.record.source,
-        project: entry.session.project,
-        phase: entry.session.phase,
-        visible: entry.session.visible,
-        npcId: entry.record.npcId ?? null,
-        lastActivityAt: new Date(entry.session.lastSeen).toISOString(),
-        status: entry.session.status,
-        error: entry.error ?? null,
-        retryAt:
-          entry.error !== undefined &&
-          Number.isFinite(entry.retryAt) &&
-          Math.abs(entry.retryAt) <= 8.64e15
-            ? new Date(entry.retryAt).toISOString()
-            : null,
-      })),
+      pool: {
+        total: this.#entries.size,
+        assigned: [...this.#entries.values()].filter(
+          (entry) => entry.record.sessionKey !== undefined,
+        ).length,
+        available: [...this.#entries.values()].filter(
+          (entry) =>
+            entry.record.sessionKey === undefined &&
+            !entry.releasing &&
+            !entry.publishing &&
+            entry.error === undefined &&
+            entry.record.createName === undefined,
+        ).length,
+        releasing: [...this.#entries.values()].filter(
+          (entry) => entry.releasing,
+        ).length,
+        waiting: [...this.#sessions.values()].filter(
+          ({ session }) =>
+            session.visible && this.#assigned(session.key) === undefined,
+        ).length,
+        history: this.#sessions.size,
+        limit: this.#options.maxSessions,
+        slots: [...this.#entries.values()].map((entry) => ({
+          number: entry.record.number,
+          npcId: entry.record.npcId ?? null,
+          assigned: entry.record.sessionKey !== undefined,
+          releasing: entry.releasing,
+          error: entry.error ?? null,
+          recovering:
+            entry.startupHidePending || entry.record.createName !== undefined,
+        })),
+      },
+      sessions: [...this.#entries.values()]
+        .filter((entry) => entry.record.sessionKey !== undefined)
+        .map((entry) => ({
+          name: this.#name(entry),
+          source: entry.session.source,
+          project: entry.session.project,
+          phase: entry.session.phase,
+          visible: entry.session.visible,
+          npcId: entry.record.npcId ?? null,
+          location: this.#visual(entry).location,
+          reviewUntil:
+            entry.session.reviewUntil !== undefined &&
+            now < entry.session.reviewUntil
+              ? new Date(entry.session.reviewUntil).toISOString()
+              : null,
+          lastActivityAt: new Date(entry.session.lastSeen).toISOString(),
+          status: entry.session.status,
+          error: entry.error ?? null,
+          retryAt:
+            entry.error !== undefined &&
+            Number.isFinite(entry.retryAt) &&
+            Math.abs(entry.retryAt) <= 8.64e15
+              ? new Date(entry.retryAt).toISOString()
+              : null,
+        })),
     };
   }
 
@@ -957,9 +1138,12 @@ export class NpcCoordinator implements SessionSink {
       this.#timer = undefined;
     }
     this.#pending = [];
+    for (const history of this.#sessions.values()) {
+      history.session.hide(this.#now());
+      this.#sync(history);
+    }
     for (const entry of this.#entries.values()) {
-      entry.session.hide(this.#now());
-      this.#sync(entry);
+      entry.releasing = true;
     }
     await Promise.allSettled([...this.#io]);
     // Two sequential workers preserve per-NPC ordering and bound shutdown load.

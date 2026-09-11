@@ -120,11 +120,10 @@ export function normalizeSession(
       return undefined;
     }
     const shortName = toolName.split('.').at(-1) ?? toolName;
-    const isQuestion = [
-      'AskUserQuestion',
-      'request_user_input',
-      'request_user_input_async',
-    ].includes(shortName);
+    // Queued async questions do not block the agent or require a follow visit.
+    const isQuestion = ['AskUserQuestion', 'request_user_input'].includes(
+      shortName,
+    );
     if (kind === 'tool-start' && isQuestion) {
       kind = 'question';
     }

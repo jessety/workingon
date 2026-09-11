@@ -81,7 +81,9 @@ export interface Configuration {
   npcStaleMinutes: number;
   npcSummaryIntervalSeconds: number;
   npcSpeechCooldownSeconds: number;
+  /** Shared physical pool and concurrent lease limit, independent of session history. */
   npcMaxSessions: number;
+  /** One user-level ownership ledger shared by every checkout on this machine. */
   npcStateFile: string;
 
   /** Summarize and log, but never write a status anywhere */

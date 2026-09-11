@@ -233,6 +233,32 @@ describe('NPC lifecycle reducer', () => {
     expect(current.phase).toBe('working');
   });
 
+  test('queued questions cannot clear a separate blocking question', () => {
+    const current = session();
+    current.apply(
+      signal('PreToolUse', {
+        tool_name: 'functions.request_user_input',
+        tool_use_id: 'blocking-question',
+      }),
+    );
+    for (const hook of ['PreToolUse', 'PostToolUse']) {
+      current.apply(
+        signal(hook, {
+          tool_name: 'functions.request_user_input_async',
+          tool_use_id: 'queued-question',
+        }),
+      );
+      expect(current.phase).toBe('waiting-input');
+    }
+    current.apply(
+      signal('PostToolUse', {
+        tool_name: 'functions.request_user_input',
+        tool_use_id: 'blocking-question',
+      }),
+    );
+    expect(current.phase).toBe('working');
+  });
+
   test('handles permission payloads without a tool id by actor and tool name', () => {
     const current = session();
     current.apply(

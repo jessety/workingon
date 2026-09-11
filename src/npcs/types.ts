@@ -92,14 +92,19 @@ export interface NpcClient {
   };
 }
 
-/** The ONLY per-session data written to disk. No prompts, projects, or prose. */
+/** Session history contains identity/lifecycle metadata only, never prose. */
 export interface NpcRecord {
   key: string;
   source: ActivitySource;
-  number: number;
   lastSeen: number;
   hiddenAt?: number;
   ended: boolean;
+}
+
+/** A persistent character, leased to at most one session at a time. */
+export interface NpcSlot {
+  number: number;
+  sessionKey?: string;
   npcId?: string;
   createName?: string;
   creationAttempted?: boolean;
@@ -107,12 +112,13 @@ export interface NpcRecord {
 }
 
 export interface NpcState {
-  version: 1;
+  version: 2;
   installation: string;
   account: string;
   ownerId: string;
-  counters: Record<ActivitySource, number>;
-  records: NpcRecord[];
+  counter: number;
+  records: NpcSlot[];
+  sessions: NpcRecord[];
 }
 
 export interface NpcStateRepository {

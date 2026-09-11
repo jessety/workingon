@@ -7,19 +7,19 @@ import path from 'node:path';
 
 function state(): NpcState {
   return {
-    version: 1,
+    version: 2,
     installation: '11111111-1111-4111-8111-111111111111',
     account: identity('test-account'),
     ownerId: 'u_owner',
-    counters: { claude: 0, codex: 1 },
-    records: [
+    counter: 1,
+    records: [{ number: 1, npcId: 'npc_1', lastSpokeAt: 0 }],
+    sessions: [
       {
         key: identity('session'),
         source: 'codex',
-        number: 1,
-        npcId: 'npc_1',
+
         lastSeen: 1000,
-        lastSpokeAt: 0,
+
         ended: false,
       },
     ],
@@ -66,13 +66,13 @@ describe('NPC ownership state', () => {
     await writer.open();
     const first = state();
     const writing = writer.save(first);
-    first.records[0]!.lastSeen = 2000;
+    first.sessions[0]!.lastSeen = 2000;
     await writing;
-    expect(JSON.parse(await readFile(file, 'utf8')).records[0].lastSeen).toBe(
+    expect(JSON.parse(await readFile(file, 'utf8')).sessions[0].lastSeen).toBe(
       1000,
     );
     await writer.save(first);
-    expect(JSON.parse(await readFile(file, 'utf8')).records[0].lastSeen).toBe(
+    expect(JSON.parse(await readFile(file, 'utf8')).sessions[0].lastSeen).toBe(
       2000,
     );
   });
@@ -81,6 +81,32 @@ describe('NPC ownership state', () => {
     await writeFile(file, '{incomplete');
     await expect(store().open()).rejects.toThrow();
     expect(await readFile(file, 'utf8')).toBe('{incomplete');
+  });
+
+  test('legacy ledgers fail closed with a reset instruction and remain intact', async () => {
+    const legacy = JSON.stringify({
+      version: 1,
+      records: [{ npcId: 'npc_legacy' }],
+    });
+    await writeFile(file, legacy);
+    await expect(store().open()).rejects.toThrow(
+      'explicit ownership-verified reset',
+    );
+    expect(await readFile(file, 'utf8')).toBe(legacy);
+  });
+
+  test('rejects dangling and duplicate leases', () => {
+    const input = state();
+    input.records[0]!.sessionKey = identity('missing');
+    expect(() => parseNpcState(input)).toThrow('lease');
+    input.records[0]!.sessionKey = input.sessions[0]!.key;
+    input.counter = 2;
+    input.records.push({
+      number: 2,
+      lastSpokeAt: 0,
+      sessionKey: input.sessions[0]!.key,
+    });
+    expect(() => parseNpcState(input)).toThrow('lease');
   });
 
   test('incomplete locks are not automatically stolen', async () => {
@@ -139,13 +165,12 @@ describe('NPC ownership state', () => {
 
   test('rejects duplicate ownership and invalid pending creation markers', () => {
     const duplicate = state();
-    duplicate.counters.codex = 2;
+    duplicate.counter = 2;
     duplicate.records.push({
       ...duplicate.records[0]!,
       number: 2,
-      key: identity('another'),
     });
-    expect(() => parseNpcState(duplicate)).toThrow('multiple sessions');
+    expect(() => parseNpcState(duplicate)).toThrow('multiple slots');
     const invalid = state();
     delete invalid.records[0]!.npcId;
     invalid.records[0]!.createName = "Jesse's manually created NPC";

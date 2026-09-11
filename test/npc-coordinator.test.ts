@@ -107,7 +107,10 @@ class Client implements NpcClient {
   };
 }
 
-function setup(overrides: Partial<NpcOptions> = {}) {
+function setup(
+  overrides: Partial<NpcOptions> = {},
+  defaultSource: 'claude' | 'codex' = 'codex',
+) {
   let now = NOW;
   const client = new Client();
   const repository = new Repository();
@@ -137,7 +140,7 @@ function setup(overrides: Partial<NpcOptions> = {}) {
   function observe(
     hook: string,
     fields: Record<string, unknown> = {},
-    source: 'codex' | 'claude' = 'codex',
+    source: 'codex' | 'claude' = defaultSource,
   ): boolean {
     const signal = normalizeSession(
       source,
@@ -200,7 +203,7 @@ describe('NPC coordination', () => {
       new Set([...h.client.characters.values()].map((npc) => npc.name)).size,
     ).toBe(5);
     expect([...h.client.characters.values()].map((npc) => npc.name)).toEqual(
-      expect.arrayContaining(["Jesse's Codex 1", "Jesse's Claude 1"]),
+      expect.arrayContaining(["Jesse's Codex 2", "Jesse's Claude 1"]),
     );
     expect(
       h.summarize.mock.calls
@@ -208,6 +211,578 @@ describe('NPC coordination', () => {
         .every((digest) => digest.match(/Task /g)?.length === 1),
     ).toBe(true);
   });
+
+  test('100 sequential sessions across providers and repositories reuse one physical NPC', async () => {
+    const h = setup({ maxSessions: 1 });
+    async function next(index: number): Promise<void> {
+      if (index === 100) {
+        return;
+      }
+      const source = index % 2 === 0 ? 'codex' : 'claude';
+      const session_id = `session-${index}`;
+      h.observe(
+        'UserPromptSubmit',
+        { session_id, cwd: `/projects/repo-${index}`, prompt: 'New work' },
+        source,
+      );
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: true,
+        name: `Jesse's ${source === 'codex' ? 'Codex' : 'Claude'} 1`,
+        location: { type: 'desk' },
+        say: null,
+      });
+      h.observe('SessionEnd', { session_id }, source);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: false,
+        say: null,
+        textStatus: null,
+      });
+      h.advance(3000);
+      await next(index + 1);
+    }
+    await next(0);
+    expect(h.client.creates).toBe(1);
+    expect(h.repository.state?.counter).toBe(1);
+    expect(h.client.deleted).toEqual([]);
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { total: 1, available: 1, history: 100, waiting: 0 },
+    });
+  });
+
+  test('three concurrent sessions turn over across sources without growing the pool', async () => {
+    const h = setup();
+    for (const session_id of ['a', 'b', 'c']) {
+      h.observe('UserPromptSubmit', { session_id, prompt: 'Work' });
+    }
+    await h.flush(6);
+    const ids = [...h.client.characters.keys()];
+    for (const session_id of ['a', 'b', 'c']) {
+      h.observe('SessionEnd', { session_id });
+    }
+    for (const session_id of ['d', 'e', 'f']) {
+      h.observe(
+        'UserPromptSubmit',
+        { session_id, prompt: 'New work' },
+        'claude',
+      );
+    }
+    await h.flush(8);
+    expect([...h.client.characters.keys()]).toEqual(ids);
+    expect([...h.client.characters.values()].map((npc) => npc.name)).toEqual([
+      "Jesse's Claude 1",
+      "Jesse's Claude 2",
+      "Jesse's Claude 3",
+    ]);
+    expect(h.client.creates).toBe(3);
+  });
+
+  test('capacity queues a new session until a lease is released', async () => {
+    const h = setup({ maxSessions: 1 });
+    h.observe('UserPromptSubmit', { prompt: 'First task' });
+    h.observe(
+      'UserPromptSubmit',
+      { session_id: 'next', prompt: 'Second task' },
+      'claude',
+    );
+    await h.flush();
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { total: 1, waiting: 1 },
+    });
+    h.observe('SessionEnd');
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.name).toBe("Jesse's Claude 1");
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { total: 1, waiting: 0 },
+    });
+  });
+
+  test('a failed release blocks reuse and pool growth until hide-and-clear is acknowledged', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Old work' });
+    await h.flush();
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockRejectedValueOnce(new Error('Hide failed'));
+    h.observe('SessionEnd');
+    h.observe(
+      'UserPromptSubmit',
+      { session_id: 'replacement', prompt: 'New work' },
+      'claude',
+    );
+    await h.flush();
+    expect(h.client.creates).toBe(1);
+    expect(h.client.characters.get('npc_1')?.name).toBe("Jesse's Codex 1");
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { releasing: 1, waiting: 1 },
+    });
+    h.advance(1000);
+    await h.flush();
+    expect(h.client.creates).toBe(1);
+    expect(h.client.characters.get('npc_1')?.name).toBe("Jesse's Claude 1");
+    const rename = h.client.writes.findIndex(
+      ({ patch }) => patch.name === "Jesse's Claude 1",
+    );
+    expect(h.client.writes[rename - 1]?.patch).toMatchObject({
+      visible: false,
+      textStatus: null,
+      say: null,
+    });
+  });
+
+  test('an in-flight patch and summary cannot spill into the next lease', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Old task' });
+    await h.flush();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const summary = deferred<NpcSummary>();
+    h.summarize.mockImplementationOnce(() => summary.promise);
+    const update = jest
+      .mocked(h.client.npcs.updateNpc)
+      .getMockImplementation()!;
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockImplementationOnce(async (id, patch) => {
+        entered.resolve();
+        await release.promise;
+        return update(id, patch);
+      });
+    h.advance(30_000);
+    h.observe('Stop');
+    const oldWork = h.coordinator.tick();
+    await entered.promise;
+    h.observe('SessionEnd');
+    h.observe(
+      'UserPromptSubmit',
+      { session_id: 'new', prompt: 'New task' },
+      'claude',
+    );
+    await h.coordinator.tick();
+    expect(h.client.creates).toBe(1);
+    release.resolve();
+    // Let the API worker finish without waiting for the old model request.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.name).toBe("Jesse's Claude 1");
+    summary.resolve({ task: 'Stale old description', say: 'Stale old speech' });
+    await oldWork;
+    await h.flush();
+    expect(JSON.stringify(h.client.characters.get('npc_1'))).not.toContain(
+      'Stale old',
+    );
+    expect(h.client.creates).toBe(1);
+  });
+
+  test('a missing pooled NPC is replaced in the same numbered slot', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    h.observe('SessionEnd');
+    await h.flush();
+    h.client.characters.delete('npc_1');
+    h.observe(
+      'UserPromptSubmit',
+      { session_id: 'replacement', prompt: 'Next task' },
+      'claude',
+    );
+    await h.flush(6);
+    expect(h.client.characters.get('npc_2')).toMatchObject({
+      name: "Jesse's Claude 1",
+      visible: true,
+    });
+    expect(h.repository.state?.counter).toBe(1);
+    expect(h.repository.state?.records).toHaveLength(1);
+  });
+
+  test('an ambiguous creation whose session ended still reserves its slot', async () => {
+    const h = setup();
+    jest
+      .spyOn(h.client.npcs, 'createNpc')
+      .mockRejectedValueOnce(new Error('Unknown delivery'));
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    h.observe('SessionEnd');
+    h.observe('UserPromptSubmit', { session_id: 'new', prompt: 'Task' });
+    h.advance(60_000);
+    await h.flush();
+    expect(h.client.npcs.createNpc).toHaveBeenCalledTimes(1);
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { total: 1, releasing: 1, waiting: 1 },
+    });
+  });
+
+  test('questions and permissions follow; review visits briefly before returning to the desk', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'desk',
+    });
+    h.observe('PreToolUse', { tool_name: 'AskUserQuestion', tool_use_id: 'q' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'user',
+      userId: 'u_owner',
+    });
+    h.observe('PostToolUse', {
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'q',
+    });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'desk',
+    });
+    h.observe('PermissionRequest', { tool_name: 'Bash', tool_use_id: 'p' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'user',
+      userId: 'u_owner',
+    });
+    h.observe('PostToolUse', { tool_name: 'Bash', tool_use_id: 'p' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'desk',
+    });
+    h.observe('Stop');
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      location: { type: 'user', userId: 'u_owner' },
+      say: { text: 'Ready for review' },
+    });
+    h.advance(30_000);
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'desk',
+    });
+    h.advance(10 * 60_000);
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: false,
+      say: null,
+      textStatus: null,
+    });
+    expect(h.coordinator.describe()).toMatchObject({ pool: { available: 1 } });
+  });
+
+  test.each([
+    ['SessionStart', 'ready', 'codex'],
+    ['UserPromptSubmit', 'working', 'codex'],
+    ['Interrupt', 'interrupted', 'codex'],
+    ['StopFailure', 'failed', 'claude'],
+  ] as const)(
+    '%s returns a following NPC to the desk, then idle hides it',
+    async (hook, phase, source) => {
+      const h = setup();
+      h.observe('UserPromptSubmit', { prompt: 'Task' }, source);
+      h.observe(
+        'PreToolUse',
+        { tool_name: 'AskUserQuestion', tool_use_id: 'q' },
+        source,
+      );
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+
+      h.observe(hook, { prompt: 'Continue' }, source);
+      await h.flush();
+      expect(h.coordinator.describe()).toMatchObject({
+        sessions: [{ phase, location: { type: 'desk' } }],
+      });
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: true,
+        location: { type: 'desk' },
+      });
+
+      h.advance((phase === 'working' ? 120 : 10) * 60_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: false,
+        say: null,
+        textStatus: null,
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        pool: { available: 1 },
+      });
+    },
+  );
+
+  test.each(['claude', 'codex'] as const)(
+    '%s: review follows and speaks once for exactly 30 seconds without duplicate Stop extensions',
+    async (source) => {
+      const h = setup({}, source);
+      h.observe('UserPromptSubmit', { prompt: 'Task', turn_id: 't1' });
+      await h.flush();
+      h.observe('Stop', { turn_id: 't1' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: true,
+        location: { type: 'user', userId: 'u_owner' },
+        say: { text: 'Ready for review' },
+      });
+      h.advance(20_000);
+      h.observe('Stop', { turn_id: 't1' });
+      await h.flush();
+      h.advance(9999);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+      expect(h.client.characters.get('npc_1')?.say).toEqual({
+        text: 'Ready for review',
+      });
+      h.advance(1);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: true,
+        location: { type: 'desk' },
+        say: null,
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        sessions: [{ phase: 'finished', reviewUntil: null }],
+      });
+      h.advance(60_000);
+      h.observe('Stop', { turn_id: 't1' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'desk',
+      });
+      expect(
+        h.client.writes.filter(
+          ({ patch }) => patch.say?.text === 'Ready for review',
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  test.each(['request_user_input_async', 'functions.request_user_input_async'])(
+    '%s stays at the desk while its question is queued',
+    async (toolName) => {
+      const h = setup();
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      await h.flush();
+      const checkHook = async (hook: string): Promise<void> => {
+        h.observe(hook, {
+          tool_name: toolName,
+          tool_use_id: 'queued-question',
+        });
+        await h.flush();
+        expect(h.coordinator.describe()).toMatchObject({
+          sessions: [{ phase: 'working', location: { type: 'desk' } }],
+        });
+        expect(h.client.characters.get('npc_1')).toMatchObject({
+          visible: true,
+          location: { type: 'desk' },
+          say: null,
+        });
+      };
+      await checkHook('PreToolUse');
+      await checkHook('PostToolUse');
+    },
+  );
+
+  test.each([
+    ['claude', 'PreToolUse', 'AskUserQuestion'],
+    ['codex', 'PreToolUse', 'request_user_input'],
+    ['claude', 'PermissionRequest', 'Bash'],
+    ['codex', 'PermissionRequest', 'Bash'],
+  ] as const)(
+    '%s %s outlasts the previous review timer until resolved',
+    async (source, hook, toolName) => {
+      const h = setup({}, source);
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      await h.flush();
+      h.observe('Stop');
+      await h.flush();
+      h.advance(20_000);
+      h.observe(hook, {
+        tool_name: toolName,
+        ...(hook === 'PermissionRequest' ? {} : { tool_use_id: 'wait' }),
+      });
+      await h.flush();
+      h.advance(20_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+      expect(h.client.characters.get('npc_1')?.say).not.toEqual({
+        text: 'Ready for review',
+      });
+      h.observe('PostToolUse', { tool_name: toolName, tool_use_id: 'wait' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'desk',
+      });
+    },
+  );
+
+  test.each(['claude', 'codex'] as const)(
+    '%s: resumed work cancels review, and a later response gets its own window',
+    async (source) => {
+      const h = setup({}, source);
+      h.observe('UserPromptSubmit', { prompt: 'First', turn_id: 't1' });
+      await h.flush();
+      h.observe('Stop', { turn_id: 't1' });
+      await h.flush();
+      h.advance(10_000);
+      h.observe('UserPromptSubmit', { prompt: 'Next', turn_id: 't2' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        location: { type: 'desk' },
+        say: null,
+      });
+      h.advance(10_000);
+      h.observe('Stop', { turn_id: 't2' });
+      await h.flush();
+      h.advance(10_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        location: { type: 'user', userId: 'u_owner' },
+        say: { text: 'Ready for review' },
+      });
+      h.advance(20_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        location: { type: 'desk' },
+        say: null,
+      });
+      expect(
+        h.client.writes.filter(
+          ({ patch }) => patch.say?.text === 'Ready for review',
+        ),
+      ).toHaveLength(2);
+    },
+  );
+
+  test.each(['claude', 'codex'] as const)(
+    '%s: slow publication cannot extend a review visit or replay its announcement',
+    async (source) => {
+      const h = setup({}, source);
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      await h.flush();
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const update = jest
+        .mocked(h.client.npcs.updateNpc)
+        .getMockImplementation()!;
+      jest
+        .spyOn(h.client.npcs, 'updateNpc')
+        .mockImplementationOnce(async (id, patch) => {
+          entered.resolve();
+          await release.promise;
+          return update(id, patch);
+        });
+      h.observe('Stop');
+      const work = h.coordinator.tick();
+      await entered.promise;
+      h.advance(30_000);
+      await h.coordinator.tick();
+      release.resolve();
+      await work;
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        location: { type: 'desk' },
+        say: null,
+      });
+      expect(
+        h.client.writes.filter(
+          ({ patch }) => patch.say?.text === 'Ready for review',
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  test('capacity delays do not produce a stale review visit', async () => {
+    const h = setup({ maxSessions: 1 });
+    h.observe('UserPromptSubmit', { prompt: 'Occupy pool' });
+    await h.flush();
+    h.observe('UserPromptSubmit', {
+      session_id: 'queued',
+      prompt: 'Queued work',
+    });
+    h.observe('Stop', { session_id: 'queued' });
+    h.advance(30_000);
+    h.observe('SessionEnd');
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: true,
+      location: { type: 'desk' },
+      say: null,
+    });
+    expect(
+      h.client.writes.filter(
+        ({ patch }) => patch.say?.text === 'Ready for review',
+      ),
+    ).toHaveLength(0);
+  });
+
+  test.each(['claude', 'codex'] as const)(
+    '%s: restart hides review NPCs without replaying their visit or persisting its timer',
+    async (source) => {
+      const h = setup({}, source);
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      await h.flush();
+      h.observe('Stop');
+      await h.flush();
+      expect(JSON.stringify(h.repository.state)).not.toMatch(
+        /reviewUntil|Ready for review/,
+      );
+      const before = h.client.writes.length;
+      const restarted = new NpcCoordinator(h.options);
+      await restarted.tick();
+      await restarted.tick();
+      await restarted.tick();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: false,
+        say: null,
+      });
+      expect(
+        h.client.writes
+          .slice(before)
+          .some(({ patch }) => patch.visible === true),
+      ).toBe(false);
+      await restarted.stop();
+    },
+  );
+
+  test.each(['claude', 'codex'] as const)(
+    '%s: review announcements accompany concurrent visits even after recent ordinary speech',
+    async (source) => {
+      const h = setup({}, source);
+      for (const session_id of ['a', 'b']) {
+        h.observe('UserPromptSubmit', { session_id, prompt: 'Task' });
+      }
+      await h.flush();
+      h.observe('PermissionRequest', { session_id: 'a', tool_name: 'Bash' });
+      await h.flush();
+      expect(
+        h.client.writes.some(
+          ({ patch }) => patch.say?.text === 'I need permission to continue',
+        ),
+      ).toBe(true);
+      for (const session_id of ['a', 'b']) {
+        h.observe('Stop', { session_id });
+      }
+      await h.flush();
+      expect(
+        [...h.client.characters.values()].every(
+          (npc) => npc.say?.text === 'Ready for review',
+        ),
+      ).toBe(true);
+      h.advance(30_000);
+      await h.flush();
+      expect(
+        [...h.client.characters.values()].every(
+          (npc) => npc.say === null && npc.location?.type === 'desk',
+        ),
+      ).toBe(true);
+    },
+  );
 
   test('writes creation intent before POST and the id before any visible PATCH', async () => {
     const h = setup();
@@ -255,7 +830,7 @@ describe('NPC coordination', () => {
     expect(h.client.creates).toBe(0);
   });
 
-  test('hides idle NPCs, reuses their IDs, and deletes on session end', async () => {
+  test('hides idle NPCs, reuses their IDs, and releases on session end', async () => {
     const h = setup();
     h.observe('UserPromptSubmit', { prompt: 'Task', turn_id: 't1' });
     await h.flush();
@@ -269,13 +844,15 @@ describe('NPC coordination', () => {
     expect(h.client.creates).toBe(1);
     h.observe('SessionEnd');
     await h.flush();
-    expect(h.client.characters.size).toBe(0);
+    expect(h.client.characters.size).toBe(1);
+    expect(h.client.characters.get('npc_1')?.visible).toBe(false);
+    expect(h.client.deleted).toEqual([]);
     expect(h.observe('PostToolUse', { tool_name: 'Bash', turn_id: 't2' })).toBe(
       false,
     );
   });
 
-  test('keeps long-running tools visible and eventually deletes stale hidden NPCs', async () => {
+  test('keeps long-running tools visible and retains stale hidden NPCs for reuse', async () => {
     const h = setup();
     h.observe('UserPromptSubmit', { prompt: 'Run a lengthy operation' });
     await h.flush();
@@ -287,31 +864,50 @@ describe('NPC coordination', () => {
     expect(h.client.characters.get('npc_1')?.visible).toBe(false);
     h.advance(RETENTION_MS);
     await h.flush();
-    expect(h.client.characters.size).toBe(0);
+    expect(h.client.characters.size).toBe(1);
+    expect(h.client.characters.get('npc_1')?.visible).toBe(false);
+    expect(h.client.deleted).toEqual([]);
   });
 
-  test('moves to the desk while offline and follows the owner on return', async () => {
-    const h = setup();
-    h.observe('UserPromptSubmit', { prompt: 'Task' });
-    await h.flush();
-    expect(h.client.characters.get('npc_1')?.location).toEqual({
-      type: 'user',
-      userId: 'u_owner',
-    });
-    h.client.availability = 'offline';
-    h.advance(30_000);
-    await h.flush();
-    expect(h.client.characters.get('npc_1')?.location).toEqual({
-      type: 'desk',
-    });
-    h.client.availability = 'available';
-    h.advance(30_000);
-    await h.flush();
-    expect(h.client.characters.get('npc_1')?.location).toEqual({
-      type: 'user',
-      userId: 'u_owner',
-    });
-  });
+  test.each([
+    ['PreToolUse', 'AskUserQuestion'],
+    ['PermissionRequest', 'Bash'],
+  ])(
+    '%s follows only while online and still hides after inactivity',
+    async (hook, toolName) => {
+      const h = setup();
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      h.observe(hook, { tool_name: toolName, tool_use_id: 'waiting' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+      h.client.availability = 'offline';
+      h.advance(30_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'desk',
+      });
+      h.client.availability = 'available';
+      h.advance(30_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+      h.advance(10 * 60_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        visible: false,
+        say: null,
+        textStatus: null,
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        pool: { available: 1 },
+      });
+    },
+  );
 
   test('a session ending during creation can never be made visible by the stale create response', async () => {
     const h = setup();
@@ -337,7 +933,9 @@ describe('NPC coordination', () => {
     expect(h.client.writes.some(({ patch }) => patch.visible === true)).toBe(
       false,
     );
-    expect(h.client.characters.size).toBe(0);
+    expect(h.client.characters.size).toBe(1);
+    expect(h.client.characters.get('npc_1')?.visible).toBe(false);
+    expect(h.client.deleted).toEqual([]);
   });
 
   test('overlapping pulses allow only two concurrent NPC workers while hooks keep recording', async () => {
@@ -522,8 +1120,16 @@ describe('NPC coordination', () => {
     h.observe('UserPromptSubmit', { session_id: 'b', prompt: 'Task B' });
     await h.flush();
     h.advance(2000);
-    h.observe('Stop', { session_id: 'a' });
-    h.observe('Stop', { session_id: 'b' });
+    h.observe('PermissionRequest', {
+      session_id: 'a',
+      tool_name: 'Bash',
+      tool_use_id: 'p',
+    });
+    h.observe('PermissionRequest', {
+      session_id: 'b',
+      tool_name: 'Bash',
+      tool_use_id: 'p',
+    });
     await h.flush();
     const spoken = () =>
       h.client.writes.filter(
@@ -648,7 +1254,7 @@ describe('NPC coordination', () => {
       restarted.observe(resume);
       await restarted.tick();
       const id = saved.records.find(
-        (record) => record.key === resume.key,
+        (record) => record.sessionKey === resume.key,
       )!.npcId!;
       expect(h.client.characters.get(id)?.visible).toBe(true);
       expect(h.client.creates).toBe(3);
@@ -779,9 +1385,12 @@ describe('NPC coordination', () => {
         session_id: 'second',
         prompt: 'Overflow',
       }),
-    ).toBe(false);
+    ).toBe(true);
     await h.flush();
     expect(h.client.creates).toBe(0);
+    expect(h.coordinator.describe()).toMatchObject({
+      pool: { total: 1, waiting: 1 },
+    });
     expect(JSON.stringify(h.coordinator.describe())).toContain(
       'npc_state_write_failed',
     );
