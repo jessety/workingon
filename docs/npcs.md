@@ -54,6 +54,7 @@ Ordinary speech bubbles mark questions and meaningful milestones. They are limit
 | ------------------------------ | ------------------------------------ | -------------------------------------------------------------------------------- |
 | `NPC_ENABLED`                  | `FALSE`                              | Enable companions alongside personal statuses                                    |
 | `NPC_NAME_PREFIX`              | empty                                | Derive a possessive first name; fallback `My`                                    |
+| `NPC_CHARACTER_CONFIG`         | empty                                | Optional complete v5 character JSON shared by all NPCs                           |
 | `NPC_IDLE_MINUTES`             | `10`                                 | Hide waiting, ready, interrupted, or finished sessions                           |
 | `NPC_STALE_MINUTES`            | `120`                                | Hide working sessions with no hooks; must be at least the idle timeout           |
 | `NPC_SUMMARY_INTERVAL_SECONDS` | `30`                                 | Minimum interval between summary attempts for a session                          |
@@ -63,9 +64,31 @@ Ordinary speech bubbles mark questions and meaningful milestones. They are limit
 
 Run one service instance for your user on this machine, forwarding hooks from every repository to it. All checkouts must use the same user-level `NPC_STATE_FILE`; do not set a different file per repository or agent. Its exclusive lock refuses a second writer. At the pool limit, new sessions wait for an available slot. A slot awaiting cleanup or uncertain creation does not trigger extra NPC creation. Lowering the limit retains existing hidden characters but caps simultaneous leases; it does not delete NPCs. Session turnover alone never requires raising the pool limit. The personal activity lane continues independently.
 
+### Character appearance
+
+Leave `NPC_CHARACTER_CONFIG` empty to use the owner's appearance copied by SoWork when each NPC is created. To override it, paste one complete configuration as a single line of JSON in `.env`. The installed `sowork` library exports this shape:
+
+```ts
+interface NpcCharacterConfiguration {
+  bodyType: string;
+  slots: Record<string, string>; // Slot ID → asset ID
+  version: 5;
+}
+```
+
+The example below contains placeholders; replace them with real values from a complete character configuration. Use the inner character object, without a surrounding `character` property. Slot names and asset IDs depend on the body type and are not enumerated by the SDK. workingon validates the JSON shape at startup; SoWork validates the actual asset combinations.
+
+```dotenv
+NPC_CHARACTER_CONFIG={"bodyType":"BODY_TYPE_ID","slots":{"SLOT_ID":"ASSET_ID"},"version":5}
+```
+
+After editing `.env`, run `npm run build` if needed and `pm2 restart workingon`. The override applies to both new and reused NPCs as they become active. Startup hiding still completes before reuse. Appearance is sent only when it changes, so ordinary movement and status updates do not repeatedly submit it.
+
+Before the first override, workingon durably saves each NPC's original appearance in the ownership ledger. New NPCs are created hidden with the owner's appearance first, then receive the override before becoming visible; the owner therefore needs an existing character even when an override is set. Clearing the setting restores the saved original on the next reuse, including after a crash or restart, without creating replacement NPCs. This is a snapshot, not automatic synchronization with later edits to the owner's avatar. Existing pool entries gain this optional metadata automatically; no ledger reset is needed.
+
 ## Storage and recovery
 
-Activity and generated prose remain in memory. The state file stores installation identity, a hash binding it to the endpoint/credential, owner ID, hashed session keys, allocated numbers, NPC IDs, timestamps, and pending creation markers. It contains no project names, prompts, tool output, descriptions, or speech. The file is written atomically with owner-only permissions. Dry runs do not read, lock, or write it.
+Activity and generated prose remain in memory. The state file stores installation identity, a hash binding it to the endpoint/credential, owner ID, hashed session keys, allocated numbers, NPC IDs, timestamps, pending creation markers, and original character configurations when overriding appearance. It contains no project names, prompts, tool output, descriptions, or speech. The file is written atomically with owner-only permissions. Dry runs do not read, lock, or write it.
 
 Before a create request, the service saves an intent with a unique temporary name. It creates that NPC with `visible:false`, saves the returned ID, and only then gives it its display name and makes it visible. If a request times out after the server may have accepted it, recovery scans every page of the NPC list for that exact marker and owner. It never adopts characters just because their visible names look like `Jesse's Codex 1`.
 

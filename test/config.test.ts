@@ -1,4 +1,6 @@
+import envSmart from 'env-smart';
 import { validate, type Configuration } from '../src/config.js';
+import { parseNpcCharacterConfig } from '../src/npcs/character.js';
 
 function configuration(overrides: Partial<Configuration> = {}): Configuration {
   return {
@@ -20,6 +22,7 @@ function configuration(overrides: Partial<Configuration> = {}): Configuration {
     planContextChars: 400,
     npcEnabled: false,
     npcNamePrefix: '',
+    npcCharacterConfig: '',
     npcIdleMinutes: 10,
     npcStaleMinutes: 120,
     npcSummaryIntervalSeconds: 30,
@@ -79,6 +82,78 @@ describe('validate', () => {
     expect(validate(configuration({ npcEnabled: true, dryRun: true }))).toEqual(
       [],
     );
+  });
+
+  test.each(['', '   '])(
+    'empty character override uses the API default: %p',
+    (raw) => {
+      expect(parseNpcCharacterConfig(raw)).toBeUndefined();
+    },
+  );
+
+  test.each(['', "'", '"'])(
+    'reads character JSON through env-smart with %p wrapping quotes',
+    (quote) => {
+      const character = {
+        version: 5,
+        bodyType: 'example-body',
+        slots: { hair: 'example-hair', shirt: 'example-shirt' },
+      };
+      const parsed = envSmart.parse(
+        `NPC_CHARACTER_CONFIG=${quote}${JSON.stringify(character)}${quote}`,
+      );
+      const raw = parsed.NPC_CHARACTER_CONFIG as string;
+      expect(parseNpcCharacterConfig(raw)).toEqual(character);
+      expect(
+        validate(
+          configuration({
+            npcEnabled: true,
+            dryRun: true,
+            npcCharacterConfig: raw,
+          }),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  test.each([
+    '{"secret":"do-not-log"',
+    'null',
+    '[]',
+    'false',
+    '{}',
+    '{"version":4,"bodyType":"body","slots":{}}',
+    '{"version":5,"bodyType":"","slots":{}}',
+    '{"version":5,"bodyType":42,"slots":{}}',
+    '{"version":5,"bodyType":"body","slots":[]}',
+    '{"version":5,"bodyType":"body","slots":{"hair":42}}',
+    '{"version":5,"bodyType":"body","slots":{"hair":null}}',
+    '{"version":5,"bodyType":"body","slots":{},"secret":"do-not-log"}',
+  ])(
+    'rejects malformed character overrides without echoing input: %p',
+    (raw) => {
+      const problems = validate(
+        configuration({
+          npcEnabled: true,
+          dryRun: true,
+          npcCharacterConfig: raw,
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain('NPC_CHARACTER_CONFIG');
+      expect(problems[0]).not.toContain('do-not-log');
+    },
+  );
+
+  test('an unused character override does not prevent personal statuses', () => {
+    expect(
+      validate(
+        configuration({
+          soworkApiKey: 'sw_x',
+          npcCharacterConfig: 'invalid',
+        }),
+      ),
+    ).toEqual([]);
   });
 
   test.each([NaN, Infinity, 0, -1])(

@@ -61,6 +61,39 @@ describe('NPC ownership state', () => {
     await expect(store().open()).rejects.toThrow('locked');
   });
 
+  test('round-trips the original appearance for restoring after an override', async () => {
+    const input = state();
+    input.records[0]!.originalCharacterConfig = {
+      version: 5,
+      bodyType: 'original-body',
+      slots: { hair: 'original-hair' },
+    };
+    const writer = store();
+    await writer.open();
+    await writer.save(input);
+    await writer.close();
+    await expect(store().open()).resolves.toEqual(input);
+  });
+
+  test('rejects malformed original appearances and originals without their NPC id', () => {
+    const input = state();
+    Object.assign(input.records[0]!, {
+      originalCharacterConfig: {
+        version: 5,
+        bodyType: 'body',
+        slots: { hair: { secret: 'private' } },
+      },
+    });
+    expect(() => parseNpcState(input)).toThrow();
+    input.records[0]!.originalCharacterConfig = {
+      version: 5,
+      bodyType: 'body',
+      slots: {},
+    };
+    delete input.records[0]!.npcId;
+    expect(() => parseNpcState(input)).toThrow('missing its NPC id');
+  });
+
   test('serializes snapshots without persisting later mutations', async () => {
     const writer = store();
     await writer.open();

@@ -1,3 +1,4 @@
+import type { NpcCharacterConfiguration } from 'sowork';
 import type { ActivitySource } from '../activity/events.js';
 
 export type SessionKind =
@@ -60,10 +61,12 @@ export interface Npc {
   ownerId: string;
   name: string;
   createdAt: number;
+  characterConfig: NpcCharacterConfiguration;
 }
 
 export interface NpcPatch {
   name?: string;
+  characterConfig?: NpcCharacterConfiguration;
   visible?: boolean;
   location?: NpcLocation;
   textStatus?: string | null;
@@ -106,6 +109,8 @@ export interface NpcSlot {
   number: number;
   sessionKey?: string;
   npcId?: string;
+  /** Appearance saved before the first override; no activity or generated text. */
+  originalCharacterConfig?: NpcCharacterConfiguration;
   createName?: string;
   creationAttempted?: boolean;
   lastSpokeAt: number;

@@ -78,6 +78,7 @@ export class DryRunNpcClient implements NpcClient {
         ownerId: 'dry-run',
         name: data.name,
         createdAt: Math.floor(Date.now() / 1000),
+        characterConfig: { version: 5, bodyType: 'dry-run-owner', slots: {} },
       };
       this.#npcs.set(npc.id, npc);
       log.info('[dry run] Would create hidden NPC', { id: npc.id });
@@ -100,6 +101,9 @@ export class DryRunNpcClient implements NpcClient {
       }
       if (patch.name !== undefined) {
         npc.name = patch.name;
+      }
+      if (patch.characterConfig !== undefined) {
+        npc.characterConfig = structuredClone(patch.characterConfig);
       }
       log.info('[dry run] Would update NPC', { id, ...patch });
       return Promise.resolve();

@@ -1,3 +1,4 @@
+import { readNpcCharacterConfig } from './character.js';
 import type {
   NpcRecord,
   NpcSlot,
@@ -129,6 +130,14 @@ export function parseNpcState(value: unknown): NpcState {
         throw new Error('NPC state assigns one NPC to multiple slots');
       }
       seenIds.add(result.npcId);
+    }
+    if (row.originalCharacterConfig !== undefined) {
+      if (result.npcId === undefined) {
+        throw new Error('NPC original appearance is missing its NPC id');
+      }
+      result.originalCharacterConfig = readNpcCharacterConfig(
+        row.originalCharacterConfig,
+      );
     }
     if (row.createName !== undefined) {
       result.createName = string(row.createName);

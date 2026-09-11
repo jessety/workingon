@@ -1,5 +1,7 @@
+import type { NpcCharacterConfiguration } from 'sowork';
 import { clean } from '../activity/sanitize.js';
 import { log } from '../logger.js';
+import { readNpcCharacterConfig, sameNpcCharacterConfig } from './character.js';
 import { NpcError, npcError } from './client.js';
 import { RETENTION_MS, Session } from './session.js';
 import { LegacyNpcStateError } from './state.js';
@@ -24,6 +26,7 @@ export interface NpcOptions {
   /** Hash of endpoint + credential; never the credential itself. */
   account: string;
   namePrefix: string;
+  characterConfig?: NpcCharacterConfiguration;
   idleMinutes: number;
   staleMinutes: number;
   summaryIntervalSeconds: number;
@@ -38,6 +41,7 @@ interface Entry {
   record: NpcSlot;
   releasing: boolean;
   verifiedId?: string;
+  characterConfig?: NpcCharacterConfiguration;
   startupHidePending: boolean;
   published?: string;
   publishedRevision?: number;
@@ -666,9 +670,12 @@ export class NpcCoordinator implements SessionSink {
     const reviewing =
       entry.session.phase === 'finished' &&
       this.#now() < (entry.session.reviewUntil ?? 0);
+    const characterConfig =
+      this.#options.characterConfig ?? entry.record.originalCharacterConfig;
     return {
       name: this.#name(entry),
       visible,
+      ...(visible && characterConfig !== undefined ? { characterConfig } : {}),
       location:
         visible && (waiting || reviewing) && this.#ownerOnline
           ? { type: 'user', userId: this.#state?.ownerId ?? '' }
@@ -756,6 +763,19 @@ export class NpcCoordinator implements SessionSink {
     }
   }
 
+  #rememberCharacter(entry: Entry, npc: Npc): void {
+    entry.characterConfig = readNpcCharacterConfig(npc.characterConfig);
+    if (
+      this.#options.characterConfig !== undefined &&
+      entry.record.originalCharacterConfig === undefined
+    ) {
+      entry.record.originalCharacterConfig = structuredClone(
+        entry.characterConfig,
+      );
+      this.#revision += 1;
+    }
+  }
+
   /** Scan every page; the marker is unique, but still reject duplicate matches. */
   async #findCreation(
     name: string,
@@ -840,6 +860,8 @@ export class NpcCoordinator implements SessionSink {
             this.#options.client.npcs.createNpc({
               name: record.createName ?? '',
               visible: false,
+              // Inherit the owner's appearance while hidden, then save it before
+              // applying an override. This makes clearing the override reversible.
             }),
           )
         ).data;
@@ -859,6 +881,7 @@ export class NpcCoordinator implements SessionSink {
     delete record.createName;
     delete record.creationAttempted;
     this.#revision += 1;
+    this.#rememberCharacter(entry, npc);
     await this.#persist();
     entry.verifiedId = npc.id;
     entry.published = undefined;
@@ -868,6 +891,8 @@ export class NpcCoordinator implements SessionSink {
 
   async #forgetNpc(entry: Entry): Promise<void> {
     delete entry.record.npcId;
+    delete entry.record.originalCharacterConfig;
+    entry.characterConfig = undefined;
     entry.verifiedId = undefined;
     entry.startupHidePending = false;
     entry.published = undefined;
@@ -894,6 +919,8 @@ export class NpcCoordinator implements SessionSink {
       if (data.id !== id) {
         throw new NpcError('npc_invalid_response', false);
       }
+      this.#rememberCharacter(entry, data);
+      await this.#persist();
       entry.verifiedId = id;
     }
     if (
@@ -941,6 +968,11 @@ export class NpcCoordinator implements SessionSink {
     // a hook arriving during PATCH still needs its own subsequent publication.
     const revision = entry.session.revision;
     const patch: NpcPatch = { ...visual };
+    // Appearance changes validate against the SoWork asset catalog. Avoid doing
+    // that again on every movement/status update when the config is unchanged.
+    if (sameNpcCharacterConfig(patch.characterConfig, entry.characterConfig)) {
+      delete patch.characterConfig;
+    }
     if (speech !== undefined) {
       patch.say = { text: clean(speech.text, 120) };
       entry.session.pendingSpeech = undefined;
@@ -958,6 +990,9 @@ export class NpcCoordinator implements SessionSink {
       patch.say = null;
     }
     await this.#request(() => this.#options.client.npcs.updateNpc(id, patch));
+    if (patch.characterConfig !== undefined) {
+      entry.characterConfig = structuredClone(patch.characterConfig);
+    }
     entry.published = JSON.stringify(visual);
     entry.publishedRevision = revision;
     entry.publishedLocation = JSON.stringify(visual.location);

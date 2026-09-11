@@ -3,6 +3,7 @@ import { ActivityStore } from './activity/store.js';
 import { config, validate } from './config.js';
 import { identity } from './inputs/session.js';
 import { describeError, log, setVerbose } from './logger.js';
+import { parseNpcCharacterConfig } from './npcs/character.js';
 import { createNpcClient, DryRunNpcClient } from './npcs/client.js';
 import { NpcCoordinator } from './npcs/coordinator.js';
 import { FileNpcState, MemoryNpcState } from './npcs/state.js';
@@ -112,6 +113,7 @@ const npcs = config.npcEnabled
           : `${config.soworkBaseUrl || 'https://api.sowork.com/public'}\0${config.soworkApiKey}`,
       ),
       namePrefix: config.npcNamePrefix,
+      characterConfig: parseNpcCharacterConfig(config.npcCharacterConfig),
       idleMinutes: config.npcIdleMinutes,
       staleMinutes: config.npcStaleMinutes,
       summaryIntervalSeconds: config.npcSummaryIntervalSeconds,

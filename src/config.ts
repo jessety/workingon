@@ -1,4 +1,5 @@
 import envSmart from 'env-smart';
+import { parseNpcCharacterConfig } from './npcs/character.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -77,6 +78,8 @@ export interface Configuration {
   /** Optional per-session NPC companions, independent of personal statuses. */
   npcEnabled: boolean;
   npcNamePrefix: string;
+  /** Optional JSON matching the SoWork SDK's NpcCharacterConfiguration. */
+  npcCharacterConfig: string;
   npcIdleMinutes: number;
   npcStaleMinutes: number;
   npcSummaryIntervalSeconds: number;
@@ -118,6 +121,7 @@ export const config = envSmart.config<Configuration>((env) => ({
 
   npcEnabled: env.NPC_ENABLED as boolean,
   npcNamePrefix: env.NPC_NAME_PREFIX as string,
+  npcCharacterConfig: env.NPC_CHARACTER_CONFIG as string,
   npcIdleMinutes: env.NPC_IDLE_MINUTES as number,
   npcStaleMinutes: env.NPC_STALE_MINUTES as number,
   npcSummaryIntervalSeconds: env.NPC_SUMMARY_INTERVAL_SECONDS as number,
@@ -166,6 +170,11 @@ export function validate(configuration: Configuration): string[] {
   }
 
   if (configuration.npcEnabled) {
+    try {
+      parseNpcCharacterConfig(configuration.npcCharacterConfig);
+    } catch (error) {
+      problems.push((error as Error).message);
+    }
     if (!configuration.dryRun && configuration.soworkApiKey === '') {
       problems.push('NPC_ENABLED requires SOWORK_API_KEY (or DRY_RUN=TRUE)');
     }

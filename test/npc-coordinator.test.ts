@@ -16,6 +16,16 @@ import os from 'node:os';
 import path from 'node:path';
 
 const NOW = 1_700_000_000_000;
+const OWNER_CHARACTER = {
+  version: 5 as const,
+  bodyType: 'owner-body',
+  slots: { hair: 'owner-hair' },
+};
+const CUSTOM_CHARACTER = {
+  version: 5 as const,
+  bodyType: 'custom-body',
+  slots: { hair: 'custom-hair' },
+};
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -77,6 +87,7 @@ class Client implements NpcClient {
         ownerId: this.ownerId,
         name: data.name,
         createdAt: NOW / 1000,
+        characterConfig: structuredClone(OWNER_CHARACTER),
       };
       this.characters.set(npc.id, { ...npc, visible: data.visible });
       return Promise.resolve({ data: npc });
@@ -181,6 +192,134 @@ function setup(
 }
 
 describe('NPC coordination', () => {
+  test('without an override, new NPCs inherit the owner and appearance is not patched', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    expect(h.client.npcs.createNpc).toHaveBeenCalledWith({
+      name: expect.any(String),
+      visible: false,
+    });
+    expect(h.client.characters.get('npc_1')?.characterConfig).toEqual(
+      OWNER_CHARACTER,
+    );
+    expect(
+      h.client.writes.every(({ patch }) => patch.characterConfig === undefined),
+    ).toBe(true);
+    expect(
+      h.repository.state?.records[0]?.originalCharacterConfig,
+    ).toBeUndefined();
+  });
+
+  test('saves the original appearance before applying an override and retains it across reuse', async () => {
+    const h = setup({ characterConfig: CUSTOM_CHARACTER });
+    const update = jest
+      .mocked(h.client.npcs.updateNpc)
+      .getMockImplementation()!;
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockImplementation(async (id, patch) => {
+        if (patch.characterConfig !== undefined) {
+          expect(h.repository.state?.records[0]).toMatchObject({
+            npcId: id,
+            originalCharacterConfig: OWNER_CHARACTER,
+          });
+        }
+        return update(id, patch);
+      });
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: true,
+      characterConfig: CUSTOM_CHARACTER,
+    });
+    h.observe('PermissionRequest', {
+      tool_name: 'Bash',
+      tool_use_id: 'permission',
+    });
+    await h.flush();
+    h.observe('SessionEnd');
+    await h.flush();
+    h.observe(
+      'UserPromptSubmit',
+      { session_id: 'next-session', prompt: 'Next task' },
+      'claude',
+    );
+    await h.flush();
+    expect(h.client.creates).toBe(1);
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      name: "Jesse's Claude 1",
+      characterConfig: CUSTOM_CHARACTER,
+    });
+    expect(
+      h.client.writes.filter(
+        ({ patch }) => patch.characterConfig !== undefined,
+      ),
+    ).toHaveLength(1);
+  });
+
+  test('an existing pool accepts an override after startup hiding and restores its original appearance when cleared', async () => {
+    const h = setup();
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    await h.coordinator.stop();
+    const writeStart = h.client.writes.length;
+    const custom = setup({
+      client: h.client,
+      repository: h.repository,
+      characterConfig: CUSTOM_CHARACTER,
+    });
+    custom.observe('UserPromptSubmit', { prompt: 'Next task' });
+    await custom.flush();
+    const startupWrites = h.client.writes.slice(writeStart);
+    expect(startupWrites[0]?.patch).toEqual({
+      visible: false,
+      say: null,
+      textStatus: null,
+    });
+    expect(startupWrites[1]?.patch).toMatchObject({
+      visible: true,
+      characterConfig: CUSTOM_CHARACTER,
+    });
+    expect(h.repository.state?.records[0]?.originalCharacterConfig).toEqual(
+      OWNER_CHARACTER,
+    );
+    await custom.coordinator.stop();
+    const cleared = setup({ client: h.client, repository: h.repository });
+    cleared.observe('UserPromptSubmit', { prompt: 'Another task' });
+    await cleared.flush();
+    expect(h.client.creates).toBe(1);
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: true,
+      characterConfig: OWNER_CHARACTER,
+    });
+  });
+
+  test('a failed appearance backup cannot overwrite the inherited character', async () => {
+    const h = setup({ characterConfig: CUSTOM_CHARACTER });
+    const save = h.repository.save.bind(h.repository);
+    jest.spyOn(h.repository, 'save').mockImplementation((state) => {
+      if (
+        state.records.some(
+          (record) => record.originalCharacterConfig !== undefined,
+        )
+      ) {
+        return Promise.reject(new Error('Disk unavailable'));
+      }
+      return save(state);
+    });
+    h.observe('UserPromptSubmit', { prompt: 'Task' });
+    await h.flush();
+    expect(h.coordinator.describe()).toMatchObject({
+      error: 'npc_state_write_failed',
+    });
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: false,
+      characterConfig: OWNER_CHARACTER,
+    });
+    expect(h.client.writes).toHaveLength(0);
+  });
+
   test('creates five independent companions across sources and same-project sessions', async () => {
     const h = setup();
     await h.coordinator.tick();
@@ -1156,6 +1295,7 @@ describe('NPC coordination', () => {
       name: 'Unrelated',
       visible: true,
       createdAt: 1,
+      characterConfig: structuredClone(OWNER_CHARACTER),
     });
     await h.coordinator.stop();
     const restarted = new NpcCoordinator(h.options);
