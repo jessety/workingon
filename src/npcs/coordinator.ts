@@ -1,6 +1,7 @@
 import type { NpcCharacterConfiguration } from 'sowork';
 import { clean } from '../activity/sanitize.js';
 import { log } from '../logger.js';
+import { NpcAnimations, type AnimationTarget } from './animations.js';
 import { readNpcCharacterConfig, sameNpcCharacterConfig } from './character.js';
 import { NpcError, npcError } from './client.js';
 import { RETENTION_MS, Session } from './session.js';
@@ -26,6 +27,7 @@ export interface NpcOptions {
   /** Hash of endpoint + credential; never the credential itself. */
   account: string;
   namePrefix: string;
+  animationsEnabled: boolean;
   characterConfig?: NpcCharacterConfiguration;
   idleMinutes: number;
   staleMinutes: number;
@@ -37,6 +39,7 @@ export interface NpcOptions {
 }
 
 interface Entry {
+  animations: NpcAnimations;
   session: Session;
   record: NpcSlot;
   releasing: boolean;
@@ -204,6 +207,7 @@ export class NpcCoordinator implements SessionSink {
 
   #entry(session: Session, record: NpcSlot): Entry {
     return {
+      animations: new NpcAnimations(),
       session,
       record,
       releasing: false,
@@ -241,6 +245,7 @@ export class NpcCoordinator implements SessionSink {
     entry.session = this.#idleSession();
     entry.releasing = false;
     entry.startupHidePending = false;
+    entry.animations.cleared();
     entry.published = undefined;
     entry.publishedRevision = undefined;
     entry.bubble = undefined;
@@ -618,6 +623,65 @@ export class NpcCoordinator implements SessionSink {
     }
     this.#apiCursor = (this.#apiCursor + 1) % Math.max(1, entries.length);
 
+    // Commands are lower priority than normal state writes and share the same
+    // worker limits/serialization. Animation errors never poison publication.
+    for (
+      let offset = 0;
+      offset < entries.length &&
+      this.#apiCount < 2 &&
+      now >= this.#apiBlockedUntil;
+      offset += 1
+    ) {
+      const entry = entries[(this.#apiCursor + offset) % entries.length];
+      if (
+        entry === undefined ||
+        entry.publishing ||
+        entry.releasing ||
+        entry.startupHidePending
+      ) {
+        continue;
+      }
+      const target = this.#animationTarget(entry);
+      if (target === undefined || !entry.animations.needsWork(target, now)) {
+        continue;
+      }
+      entry.publishing = true;
+      this.#apiCount += 1;
+      jobs.push(
+        this.#job(async () => {
+          try {
+            await entry.animations.publish(
+              this.#options.client.npcs,
+              () =>
+                this.#animationTarget(entry) ?? {
+                  ...target,
+                  ready: false,
+                  reaction: undefined,
+                },
+              this.#now,
+              (action) => this.#request(action),
+              (failures, minimum) => this.#backoff(failures, minimum),
+              (failure) => {
+                if (failure.status === 429) {
+                  this.#apiBlockedUntil = Math.max(
+                    this.#apiBlockedUntil,
+                    this.#now() + Math.max(1000, failure.retryAfterMs),
+                  );
+                }
+                log.warn('NPC animation unavailable', {
+                  name: this.#name(entry),
+                  code: failure.code,
+                });
+              },
+            );
+          } finally {
+            entry.publishing = false;
+            this.#apiCount -= 1;
+          }
+        }),
+      );
+    }
+
     for (
       let offset = 0;
       offset < entries.length && this.#summaryCount < 2;
@@ -656,6 +720,39 @@ export class NpcCoordinator implements SessionSink {
   #name(entry: Entry): string {
     const suffix = `${entry.session.source === 'codex' ? 'Codex' : 'Claude'} ${entry.record.number}`;
     return `${clean(this.#namePrefix, 63 - suffix.length)} ${suffix}`;
+  }
+
+  #animationTarget(entry: Entry): AnimationTarget | undefined {
+    const id = entry.record.npcId;
+    const character = entry.characterConfig;
+    if (
+      id === undefined ||
+      entry.verifiedId !== id ||
+      character === undefined
+    ) {
+      return undefined;
+    }
+    const reaction = entry.session.reaction;
+    return {
+      id,
+      character,
+      reaction:
+        this.#options.animationsEnabled &&
+        !this.#stopping &&
+        !entry.releasing &&
+        !entry.startupHidePending &&
+        entry.session.visible &&
+        reaction?.revision === entry.session.revision
+          ? reaction
+          : undefined,
+      ready:
+        !this.#stopping &&
+        !entry.releasing &&
+        !entry.startupHidePending &&
+        entry.error === undefined &&
+        entry.publishedRevision === entry.session.revision &&
+        entry.published === JSON.stringify(this.#visual(entry)),
+    };
   }
 
   #visual(entry: Entry): NpcPatch {
@@ -748,6 +845,7 @@ export class NpcCoordinator implements SessionSink {
       entry.startupHidePending ||
       entry.verifiedId !== entry.record.npcId ||
       entry.releasing ||
+      entry.publishedRevision !== entry.session.revision ||
       entry.published !== JSON.stringify(this.#visual(entry)) ||
       this.#clearBubble(entry, now) ||
       this.#speechEligible(entry, now)
@@ -765,6 +863,7 @@ export class NpcCoordinator implements SessionSink {
 
   #rememberCharacter(entry: Entry, npc: Npc): void {
     entry.characterConfig = readNpcCharacterConfig(npc.characterConfig);
+    entry.animations.appearance(npc.id, entry.characterConfig);
     if (
       this.#options.characterConfig !== undefined &&
       entry.record.originalCharacterConfig === undefined
@@ -890,6 +989,7 @@ export class NpcCoordinator implements SessionSink {
   }
 
   async #forgetNpc(entry: Entry): Promise<void> {
+    entry.animations = new NpcAnimations();
     delete entry.record.npcId;
     delete entry.record.originalCharacterConfig;
     entry.characterConfig = undefined;
@@ -934,6 +1034,7 @@ export class NpcCoordinator implements SessionSink {
           visible: false,
           say: null,
           textStatus: null,
+          animation: null,
         }),
       );
       this.#release(entry);
@@ -989,9 +1090,16 @@ export class NpcCoordinator implements SessionSink {
     } else if (this.#clearBubble(entry, this.#now()) || !visual.visible) {
       patch.say = null;
     }
+    if (!visual.visible) {
+      patch.animation = null;
+    }
     await this.#request(() => this.#options.client.npcs.updateNpc(id, patch));
+    if (patch.animation === null) {
+      entry.animations.cleared();
+    }
     if (patch.characterConfig !== undefined) {
       entry.characterConfig = structuredClone(patch.characterConfig);
+      entry.animations.appearance(id, entry.characterConfig);
     }
     entry.published = JSON.stringify(visual);
     entry.publishedRevision = revision;
@@ -1079,6 +1187,7 @@ export class NpcCoordinator implements SessionSink {
     const now = this.#now();
     return {
       enabled: true,
+      animationsEnabled: this.#options.animationsEnabled,
       ready: this.#ready,
       error: this.#fatal ?? this.#initializationError ?? null,
       creationDenied: this.#creationDenied,
@@ -1142,6 +1251,7 @@ export class NpcCoordinator implements SessionSink {
           source: entry.session.source,
           project: entry.session.project,
           phase: entry.session.phase,
+          animation: entry.animations.describe(now),
           visible: entry.session.visible,
           npcId: entry.record.npcId ?? null,
           location: this.#visual(entry).location,

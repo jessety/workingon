@@ -21,6 +21,7 @@ function configuration(overrides: Partial<Configuration> = {}): Configuration {
     planMaxAgeHours: 12,
     planContextChars: 400,
     npcEnabled: false,
+    npcAnimationsEnabled: true,
     npcNamePrefix: '',
     npcCharacterConfig: '',
     npcIdleMinutes: 10,

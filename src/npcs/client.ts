@@ -78,7 +78,7 @@ export class DryRunNpcClient implements NpcClient {
         ownerId: 'dry-run',
         name: data.name,
         createdAt: Math.floor(Date.now() / 1000),
-        characterConfig: { version: 5, bodyType: 'dry-run-owner', slots: {} },
+        characterConfig: { version: 5, bodyType: 'characterA', slots: {} },
       };
       this.#npcs.set(npc.id, npc);
       log.info('[dry run] Would create hidden NPC', { id: npc.id });
@@ -94,6 +94,22 @@ export class DryRunNpcClient implements NpcClient {
         ? Promise.reject(new NpcError('npc_not_found', false, 0, 404))
         : Promise.resolve({ data: { ...npc } });
     },
+    getNpcAnimations: (id) =>
+      this.#npcs.has(id)
+        ? Promise.resolve({
+            data: {
+              animations: [
+                'reactCelebrate',
+                'reactCry',
+                'reactHype',
+                'reactLol',
+                'reactSurprise',
+                'reactThink',
+                'jump1',
+              ].map((clip) => ({ id: clip, modes: ['loop'] as ['loop'] })),
+            },
+          })
+        : Promise.reject(new NpcError('npc_not_found', false, 0, 404)),
     updateNpc: (id, patch: NpcPatch) => {
       const npc = this.#npcs.get(id);
       if (npc === undefined) {

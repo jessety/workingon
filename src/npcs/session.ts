@@ -1,10 +1,24 @@
-import type { NpcRecord, SessionPhase, SessionSignal } from './types.js';
+import type {
+  NpcRecord,
+  SessionPhase,
+  SessionReaction,
+  SessionSignal,
+} from './types.js';
 import type { ActivitySource } from '../activity/events.js';
 import { clean } from '../activity/sanitize.js';
 
 export const RETENTION_MS = 24 * 60 * 60_000;
 export const REVIEW_VISIT_MS = 30_000;
+export const REACTION_MS = 15_000;
 const MAX_EVENTS = 100;
+
+const REACTIONS: Partial<Record<SessionPhase, SessionReaction['clip']>> = {
+  working: 'reactThink',
+  'waiting-input': 'reactSurprise',
+  'waiting-permission': 'reactSurprise',
+  finished: 'reactCelebrate',
+  failed: 'reactCry',
+};
 
 const LABELS: Record<SessionPhase, string> = {
   ready: 'Ready',
@@ -38,6 +52,7 @@ export class Session {
   nextSummaryAt = 0;
   task = '';
   reviewUntil: number | undefined;
+  reaction: SessionReaction | undefined;
   pendingSpeech:
     | { text: string; revision: number; at: number; review?: boolean }
     | undefined;
@@ -124,6 +139,7 @@ export class Session {
     const wasVisible = this.visible;
     const wasPhase = this.phase;
     const compact = signal.kind === 'start' && signal.startReason === 'compact';
+    const newPrompt = root && signal.kind === 'prompt';
     if (
       root &&
       (signal.kind === 'prompt' || (signal.kind === 'start' && !compact))
@@ -261,6 +277,17 @@ export class Session {
         };
       }
     }
+    if (newPrompt || wasPhase !== this.phase || wasVisible !== this.visible) {
+      const clip = REACTIONS[this.phase];
+      this.reaction =
+        this.visible && clip !== undefined
+          ? {
+              clip,
+              revision: this.revision,
+              expiresAt: signal.at + REACTION_MS,
+            }
+          : undefined;
+    }
     return true;
   }
 
@@ -272,6 +299,14 @@ export class Session {
       this.reviewUntil = undefined;
       this.pendingSpeech = undefined;
       this.revision += 1;
+    }
+    if (
+      this.reaction !== undefined &&
+      (!this.visible ||
+        this.reaction.revision !== this.revision ||
+        now >= this.reaction.expiresAt)
+    ) {
+      this.reaction = undefined;
     }
     if (
       this.pendingSpeech !== undefined &&
@@ -289,6 +324,7 @@ export class Session {
     this.hiddenAt ??= now;
     this.reviewUntil = undefined;
     this.pendingSpeech = undefined;
+    this.reaction = undefined;
     this.revision += 1;
   }
 

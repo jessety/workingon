@@ -77,6 +77,7 @@ export interface Configuration {
 
   /** Optional per-session NPC companions, independent of personal statuses. */
   npcEnabled: boolean;
+  npcAnimationsEnabled: boolean;
   npcNamePrefix: string;
   /** Optional JSON matching the SoWork SDK's NpcCharacterConfiguration. */
   npcCharacterConfig: string;
@@ -120,6 +121,7 @@ export const config = envSmart.config<Configuration>((env) => ({
   planContextChars: env.PLAN_CONTEXT_CHARS as number,
 
   npcEnabled: env.NPC_ENABLED as boolean,
+  npcAnimationsEnabled: env.NPC_ANIMATIONS_ENABLED as boolean,
   npcNamePrefix: env.NPC_NAME_PREFIX as string,
   npcCharacterConfig: env.NPC_CHARACTER_CONFIG as string,
   npcIdleMinutes: env.NPC_IDLE_MINUTES as number,

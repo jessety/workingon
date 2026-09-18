@@ -6,7 +6,7 @@ Companions default to off. Enable them with `NPC_ENABLED=TRUE`.
 
 ## Setup
 
-1. Install the updated dependencies with `npm ci`. The lockfile selects `sowork` 0.5.0, which exposes the NPC API.
+1. Install the updated dependencies with `npm ci`. The lockfile selects `sowork` 0.7.0, which exposes the NPC and animation APIs.
 2. Set `NPC_ENABLED=TRUE` in `.env`. Live mode requires `SOWORK_API_KEY` and a role allowed to create characters. Your existing Anthropic key/model supplies the NPC descriptions.
 3. Install the additional hooks using [the Claude example](npc-hooks.claude.json) and [the Codex example](npc-hooks.codex.json).
 4. Start with `DRY_RUN=TRUE`. It simulates all NPC operations in memory, logs intended changes, and still calls Anthropic for prose. No SoWork client or live ownership file is used. Set `NPC_NAME_PREFIX=Jesse's` if you want that prefix in dry-run logs; without a live identity lookup the fallback is `My`.
@@ -48,11 +48,31 @@ Each review window starts when the response completes. Duplicate finish hooks do
 
 Ordinary speech bubbles mark questions and meaningful milestones. They are limited to one per NPC per minute and one across the group every 10 seconds, and clear after 10 seconds or when their lifecycle context changes. Pending ordinary speech expires after 30 seconds instead of becoming a backlog. The deterministic **Ready for review** announcement is exempt from these speech cooldowns so each visit explains its purpose; it is sent once per completed response and lasts only for the remaining review window. Review announcements still reserve cooldown time for subsequent ordinary speech. An ambiguous speech write is consumed rather than replayed.
 
+### Brief reactions
+
+With NPC mode enabled, `NPC_ANIMATIONS_ENABLED=TRUE` adds a brief reaction when the session changes state. Both providers use the same lifecycle mapping:
+
+| Event                                             | Animation        |
+| ------------------------------------------------- | ---------------- |
+| Starts or resumes working, including a new prompt | `reactThink`     |
+| Enters a blocking question or permission wait     | `reactSurprise`  |
+| Response finishes and is ready for review         | `reactCelebrate` |
+| Terminal session failure                          | `reactCry`       |
+
+Each reaction has a 15-second window starting at the hook. The publisher sends only the remaining whole seconds, skipping a reaction with less than a second left. Normal tools, duplicate events, compaction, and new summaries do not extend or restart it. Only the latest reaction is kept; none are persisted or replayed after a restart. A completion reaction means **ready for review**, not that the underlying task succeeded. Ordinary tool failures do not trigger crying. The other eligible clips (`reactHype`, `reactLol`, `jump1`) are not currently assigned to events; emoji animations are not used.
+
+Movement, appearance, status, and speech publish before an animation starts. Expiry, interruption, hiding, and new lifecycle states clear the old reaction. A question can therefore keep following you after its expression ends, and the review visit still lasts 30 seconds. Existing idle hiding is unchanged. As with movement, actual rendering and request timing depend on SoWork and network latency.
+
+Reactions currently require a `characterA` body and an advertised `loop` mode for the clip. The API's catalog currently lists the same clips for every body, even where the art is unsupported, so the body check is intentional. Capabilities are cached per physical NPC and appearance, refreshed after an appearance change or restart. Unsupported bodies/clips skip animation while all other behavior continues. Catalog failures back off; permanent catalog denials remain isolated until the next reuse, appearance change, or restart. An attempted start is consumed even on a timeout, while clears retry. Animation errors do not disable ordinary NPC updates.
+
+Set `NPC_ANIMATIONS_ENABLED=FALSE` and restart to disable reactions. Startup still explicitly clears old animations before any NPC is reused. No ledger migration or reset is needed.
+
 ## Configuration
 
 | Variable                       | Default                              | Meaning                                                                          |
 | ------------------------------ | ------------------------------------ | -------------------------------------------------------------------------------- |
 | `NPC_ENABLED`                  | `FALSE`                              | Enable companions alongside personal statuses                                    |
+| `NPC_ANIMATIONS_ENABLED`       | `TRUE`                               | Brief lifecycle reactions when NPC mode is enabled                               |
 | `NPC_NAME_PREFIX`              | empty                                | Derive a possessive first name; fallback `My`                                    |
 | `NPC_CHARACTER_CONFIG`         | empty                                | Optional complete v5 character JSON shared by all NPCs                           |
 | `NPC_IDLE_MINUTES`             | `10`                                 | Hide waiting, ready, interrupted, or finished sessions                           |
@@ -96,7 +116,7 @@ If recovery finds no match after an ambiguous create, it continues searching per
 
 The version 2 ledger separates persistent pool slots from temporary session history and uses one global slot counter. Version 1 ledgers fail closed with `npc_legacy_state_requires_reset`; they require a deliberate reset after stopping the service, backing up the ledger, and verifying ownership of its exact NPC IDs and pending creation markers. Never discard a legacy ledger or delete characters by a display-name prefix.
 
-On every launch, the service reads the persistent ledger and explicitly hides each recorded NPC, clearing its old status and speech after verifying ownership. A successful hide must precede reuse, even if fresh hooks arrive immediately or while the hide request is in flight. Failed hides retry with backoff; allocation waits until all restored NPCs have acknowledged cleanup. `npcs.startupHidesPending` in `/status` reports remaining startup cleanup.
+On every launch, the service reads the persistent ledger and explicitly hides each recorded NPC, clearing its old status, speech, and animation after verifying ownership. A successful hide must precede reuse, even if fresh hooks arrive immediately or while the hide request is in flight. Failed hides retry with backoff; allocation waits until all restored NPCs have acknowledged cleanup. `npcs.startupHidesPending` in `/status` reports remaining startup cleanup.
 
 Existing sessions appear on their next activity hook, borrowing the lowest available slot (which may differ from their previous one); there is no enumeration of already-open conversations. Explicitly ended sessions reject late tool/stop deliveries. Old turn IDs and duplicate tool IDs are ignored where the hooks provide them; without correlation IDs, arrival order is the available evidence. Permission hooks without tool IDs are matched by actor and tool name, which cannot perfectly distinguish simultaneous requests for the same tool.
 
@@ -105,6 +125,8 @@ Graceful shutdown attempts to hide recorded characters before releasing the file
 ## Diagnostics and troubleshooting
 
 Authenticated `GET /status` includes `npcs`: initialization status, errors, presence state, active/hidden counts, dropped signals, pending/in-flight work, API/summary request counts, and each assigned session's name, project, phase, NPC ID, desired location, active review deadline (`reviewUntil`), latest state, and retry time. `npcs.pool` reports total, assigned, available, releasing, waiting, history, limit, and individual slot errors. Visibility and status describe the desired state; pending writes or errors can mean the office has not caught up. The personal `status` object is unchanged. Warnings and errors are in PM2's `workingon-error.log`.
+
+`npcs.animationsEnabled` reports the reaction setting. Each session's `animation` reports the last possibly active clip, its deadline, whether expiry cleanup is due, an isolated error, and a skip reason such as `unsupported_body` or `unsupported_clip_or_mode`. This is command tracking, not confirmation that the viewer rendered the expression.
 
 | Diagnostic                                         | Action                                                                                                                          |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |

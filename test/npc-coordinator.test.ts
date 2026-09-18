@@ -1,5 +1,5 @@
 import { identity, normalizeSession } from '../src/inputs/session.js';
-import { NpcError } from '../src/npcs/client.js';
+import { DryRunNpcClient, NpcError } from '../src/npcs/client.js';
 import { NpcCoordinator, type NpcOptions } from '../src/npcs/coordinator.js';
 import { RETENTION_MS } from '../src/npcs/session.js';
 import { FileNpcState } from '../src/npcs/state.js';
@@ -63,6 +63,7 @@ class Repository implements NpcStateRepository {
 class Client implements NpcClient {
   ownerId = 'u_owner';
   availability: 'available' | 'offline' = 'available';
+  ownerCharacter = OWNER_CHARACTER;
   characters = new Map<string, Npc & NpcPatch>();
   writes: { id: string; patch: NpcPatch }[] = [];
   creates = 0;
@@ -87,7 +88,7 @@ class Client implements NpcClient {
         ownerId: this.ownerId,
         name: data.name,
         createdAt: NOW / 1000,
-        characterConfig: structuredClone(OWNER_CHARACTER),
+        characterConfig: structuredClone(this.ownerCharacter),
       };
       this.characters.set(npc.id, { ...npc, visible: data.visible });
       return Promise.resolve({ data: npc });
@@ -101,6 +102,18 @@ class Client implements NpcClient {
         ? Promise.reject(new NpcError('npc_not_found', false, 0, 404))
         : Promise.resolve({ data: { ...npc } });
     }),
+    getNpcAnimations: jest.fn(() =>
+      Promise.resolve({
+        data: {
+          animations: [
+            'reactThink',
+            'reactSurprise',
+            'reactCelebrate',
+            'reactCry',
+          ].map((id) => ({ id, modes: ['loop'] as ['loop'] })),
+        },
+      }),
+    ),
     updateNpc: jest.fn((id, patch) => {
       const npc = this.characters.get(id);
       if (npc === undefined) {
@@ -137,6 +150,7 @@ function setup(
     summarizer: { summarize },
     account: identity('test-account'),
     namePrefix: '',
+    animationsEnabled: true,
     idleMinutes: 10,
     staleMinutes: 120,
     summaryIntervalSeconds: 30,
@@ -190,6 +204,514 @@ function setup(
     },
   };
 }
+
+describe('NPC animations', () => {
+  const character = { ...OWNER_CHARACTER, bodyType: 'characterA' };
+  const starts = (client: Client) =>
+    client.writes.flatMap(({ patch }) =>
+      patch.animation === undefined || patch.animation === null
+        ? []
+        : [patch.animation],
+    );
+
+  test('inherited characterA appearance works without an override', async () => {
+    const h = setup();
+    h.client.ownerCharacter = character;
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    expect(starts(h.client)[0]?.clip).toBe('reactThink');
+    expect(
+      h.client.writes.every(({ patch }) => patch.characterConfig === undefined),
+    ).toBe(true);
+  });
+
+  test('dry run supplies capabilities and logs animation commands with no live client', async () => {
+    const client = new DryRunNpcClient();
+    const updates = jest.spyOn(client.npcs, 'updateNpc');
+    const h = setup({ client });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    expect(updates).toHaveBeenCalledWith('npc_dry1', {
+      animation: { clip: 'reactThink', mode: 'loop', durationSeconds: 15 },
+    });
+    await h.coordinator.stop();
+    expect(updates).toHaveBeenLastCalledWith('npc_dry1', {
+      visible: false,
+      textStatus: null,
+      say: null,
+      animation: null,
+    });
+  });
+
+  test('interruption clears promptly and idle hiding still applies to waiting sessions', async () => {
+    const h = setup({ characterConfig: character });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    h.observe('Interrupt');
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      animation: null,
+      location: { type: 'desk' },
+    });
+    h.observe('PermissionRequest', { tool_name: 'Bash' });
+    await h.flush();
+    h.advance(600_000);
+    await h.flush();
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: false,
+      animation: null,
+    });
+    expect(h.client.deleted).toEqual([]);
+  });
+
+  test('shutdown during a capability lookup never starts a late reaction', async () => {
+    const h = setup({ characterConfig: character });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const lookup = jest
+      .spyOn(h.client.npcs, 'getNpcAnimations')
+      .getMockImplementation()!;
+    jest
+      .spyOn(h.client.npcs, 'getNpcAnimations')
+      .mockImplementation(async (id) => {
+        entered.resolve();
+        await release.promise;
+        return lookup(id);
+      });
+    h.observe('UserPromptSubmit');
+    const publishing = h.flush();
+    await entered.promise;
+    const stopping = h.coordinator.stop();
+    release.resolve();
+    await Promise.all([publishing, stopping]);
+    expect(starts(h.client)).toEqual([]);
+    expect(h.client.writes.at(-1)?.patch).toEqual({
+      visible: false,
+      textStatus: null,
+      say: null,
+      animation: null,
+    });
+  });
+
+  test('a replaced NPC refreshes its capability cache before starting again', async () => {
+    const h = setup({ characterConfig: character });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    h.client.characters.delete('npc_1');
+    h.observe('PermissionRequest', { tool_name: 'Bash' });
+    await h.flush(7);
+    expect(h.client.npcs.getNpcAnimations).toHaveBeenNthCalledWith(1, 'npc_1');
+    expect(h.client.npcs.getNpcAnimations).toHaveBeenNthCalledWith(2, 'npc_2');
+    expect(h.client.characters.get('npc_2')?.animation).toMatchObject({
+      clip: 'reactSurprise',
+    });
+  });
+
+  test.each(['codex', 'claude'] as const)(
+    '%s reacts briefly without shortening attention or review visits',
+    async (source) => {
+      const h = setup({ characterConfig: character }, source);
+      h.observe('UserPromptSubmit', { prompt: 'Task' });
+      await h.flush();
+      expect(starts(h.client)).toEqual([
+        { clip: 'reactThink', mode: 'loop', durationSeconds: 15 },
+      ]);
+      const firstStart = h.client.writes.findIndex(
+        ({ patch }) =>
+          patch.animation !== undefined && patch.animation !== null,
+      );
+      expect(h.client.writes[firstStart - 1]?.patch).toMatchObject({
+        visible: true,
+        location: { type: 'desk' },
+      });
+      h.advance(5000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.animation?.clip).toBe(
+        'reactThink',
+      );
+      h.advance(9999);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.animation?.clip).toBe(
+        'reactThink',
+      );
+      h.advance(1);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.animation).toBeNull();
+      const question =
+        source === 'claude'
+          ? 'AskUserQuestion'
+          : 'functions.request_user_input';
+      h.observe('PreToolUse', { tool_name: question, tool_use_id: 'question' });
+      await h.flush();
+      expect(starts(h.client).at(-1)).toEqual({
+        clip: 'reactSurprise',
+        mode: 'loop',
+        durationSeconds: 15,
+      });
+      h.advance(15_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        animation: null,
+        location: { type: 'user' },
+      });
+      h.observe('PostToolUse', {
+        tool_name: question,
+        tool_use_id: 'question',
+      });
+      await h.flush();
+      expect(starts(h.client).at(-1)?.clip).toBe('reactThink');
+      h.observe('PermissionRequest', {
+        tool_name: 'Bash',
+        tool_use_id: 'permission',
+      });
+      await h.flush();
+      expect(starts(h.client).at(-1)?.clip).toBe('reactSurprise');
+      h.observe('Stop');
+      await h.flush();
+      expect(starts(h.client).at(-1)).toEqual({
+        clip: 'reactCelebrate',
+        mode: 'loop',
+        durationSeconds: 15,
+      });
+      h.advance(15_000);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        animation: null,
+        location: { type: 'user' },
+        say: { text: 'Ready for review' },
+      });
+      h.advance(14_999);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toMatchObject({
+        type: 'user',
+      });
+      h.advance(1);
+      await h.flush();
+      expect(h.client.characters.get('npc_1')).toMatchObject({
+        location: { type: 'desk' },
+        say: null,
+      });
+      expect(h.client.npcs.getNpcAnimations).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(h.repository.state)).not.toMatch(
+        /reactThink|animation|reaction|expiresAt/,
+      );
+    },
+  );
+
+  test('tool failure is not a crying reaction; terminal Claude failure is', async () => {
+    const h = setup({ characterConfig: character }, 'claude');
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    h.observe('PostToolUseFailure', {
+      tool_name: 'Bash',
+      tool_use_id: 'failed-tool',
+    });
+    await h.flush();
+    expect(starts(h.client)).toHaveLength(1);
+    h.observe('StopFailure');
+    await h.flush();
+    expect(starts(h.client).at(-1)).toEqual({
+      clip: 'reactCry',
+      mode: 'loop',
+      durationSeconds: 15,
+    });
+    expect(h.client.characters.get('npc_1')?.location).toEqual({
+      type: 'desk',
+    });
+  });
+
+  test('normal updates and duplicate events never repeat a start, but a new working turn does', async () => {
+    const h = setup({ characterConfig: character });
+    h.observe('UserPromptSubmit', { turn_id: 'one' });
+    await h.flush();
+    h.advance(1000);
+    h.observe('UserPromptSubmit', { turn_id: 'one' });
+    h.observe('PreToolUse', { tool_name: 'Bash', tool_use_id: 'command' });
+    h.observe('PostToolUse', { tool_name: 'Bash', tool_use_id: 'command' });
+    h.observe('PreToolUse', {
+      tool_name: 'functions.request_user_input_async',
+    });
+    h.observe('SessionStart', { source: 'compact' });
+    await h.flush();
+    expect(starts(h.client)).toHaveLength(1);
+    h.observe('UserPromptSubmit', { turn_id: 'two' });
+    await h.flush();
+    expect(starts(h.client)).toHaveLength(2);
+    h.observe('Stop', { turn_id: 'two' });
+    await h.flush();
+    h.advance(1000);
+    h.observe('Stop', { turn_id: 'two' });
+    await h.flush();
+    expect(starts(h.client)).toHaveLength(3);
+    h.advance(15_000);
+    h.observe('Stop', { turn_id: 'two' });
+    await h.flush();
+    expect(starts(h.client)).toHaveLength(3);
+  });
+
+  test.each([
+    [1600, 13],
+    [14_000, 1],
+    [14_100, undefined],
+    [15_100, undefined],
+  ] as const)(
+    'a catalog delayed %i ms cannot extend the event deadline',
+    async (delay, remaining) => {
+      const h = setup({ characterConfig: character });
+      const lookup = jest
+        .spyOn(h.client.npcs, 'getNpcAnimations')
+        .getMockImplementation()!;
+      jest
+        .spyOn(h.client.npcs, 'getNpcAnimations')
+        .mockImplementation(async (id) => {
+          h.advance(delay);
+          return lookup(id);
+        });
+      h.observe('UserPromptSubmit');
+      await h.flush();
+      expect(starts(h.client)).toEqual(
+        remaining !== undefined
+          ? [{ clip: 'reactThink', mode: 'loop', durationSeconds: remaining }]
+          : [],
+      );
+      expect(h.client.npcs.getNpcAnimations).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('a newer event during a catalog lookup supersedes the old reaction', async () => {
+    const h = setup({ characterConfig: character });
+    const lookup = jest
+      .spyOn(h.client.npcs, 'getNpcAnimations')
+      .getMockImplementation()!;
+    jest
+      .spyOn(h.client.npcs, 'getNpcAnimations')
+      .mockImplementationOnce(async (id) => {
+        h.observe('Stop');
+        return lookup(id);
+      });
+    h.observe('UserPromptSubmit');
+    await h.flush(7);
+    expect(starts(h.client)).toEqual([
+      { clip: 'reactCelebrate', mode: 'loop', durationSeconds: 15 },
+    ]);
+  });
+
+  test.each([
+    ['disabled', false, character, { id: 'reactThink', modes: ['loop'] }],
+    [
+      'body without art',
+      true,
+      OWNER_CHARACTER,
+      { id: 'reactThink', modes: ['loop'] },
+    ],
+    ['missing clip', true, character, { id: 'jump1', modes: ['loop'] }],
+    [
+      'missing loop mode',
+      true,
+      character,
+      { id: 'reactThink', modes: ['once'] },
+    ],
+  ] as const)(
+    'skips %s while publishing normal state',
+    async (_name, enabled, config, animation) => {
+      const h = setup({ characterConfig: config, animationsEnabled: enabled });
+      jest.spyOn(h.client.npcs, 'getNpcAnimations').mockResolvedValue({
+        data: {
+          animations: [{ id: animation.id, modes: [...animation.modes] }],
+        },
+      });
+      h.observe('PermissionRequest', { tool_name: 'Bash' });
+      await h.flush();
+      expect(starts(h.client)).toEqual([]);
+      expect(h.client.characters.get('npc_1')?.location).toEqual({
+        type: 'user',
+        userId: 'u_owner',
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        error: null,
+        sessions: [{ error: null }],
+      });
+      if (!enabled || config.bodyType !== 'characterA') {
+        expect(h.client.npcs.getNpcAnimations).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  test.each([
+    new NpcError('catalog_timeout', true),
+    new NpcError('catalog_denied', false, 0, 403),
+  ])(
+    'catalog failure %p is isolated and transient failures retry with backoff',
+    async (error) => {
+      const h = setup({ characterConfig: character });
+      jest
+        .spyOn(h.client.npcs, 'getNpcAnimations')
+        .mockRejectedValueOnce(error);
+      h.observe('UserPromptSubmit');
+      await h.flush(8);
+      expect(h.client.npcs.getNpcAnimations).toHaveBeenCalledTimes(1);
+      h.observe('PermissionRequest', { tool_name: 'Bash' });
+      await h.flush();
+      expect(h.client.characters.get('npc_1')?.location).toMatchObject({
+        type: 'user',
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        error: null,
+        sessions: [{ error: null, animation: { error: error.code } }],
+      });
+      h.advance(1000);
+      await h.flush();
+      expect(starts(h.client).map((animation) => animation.clip)).toEqual(
+        error.retryable ? ['reactSurprise'] : [],
+      );
+    },
+  );
+
+  test.each([
+    new NpcError('timeout', true),
+    new NpcError('animation_mode_not_supported', false, 0, 400),
+  ])(
+    'an ambiguous or rejected start %p is consumed, then cleared',
+    async (error) => {
+      const h = setup({ characterConfig: character });
+      const update = jest
+        .spyOn(h.client.npcs, 'updateNpc')
+        .getMockImplementation()!;
+      jest
+        .spyOn(h.client.npcs, 'updateNpc')
+        .mockImplementation(async (id, patch) => {
+          await update(id, patch);
+          if (patch.animation !== undefined && patch.animation !== null) {
+            throw error;
+          }
+        });
+      h.observe('UserPromptSubmit');
+      await h.flush(8);
+      h.advance(1000);
+      await h.flush();
+      expect(starts(h.client)).toHaveLength(1);
+      h.observe('PermissionRequest', { tool_name: 'Bash' });
+      await h.coordinator.tick();
+      expect(h.client.characters.get('npc_1')?.location).toMatchObject({
+        type: 'user',
+      });
+      expect(h.coordinator.describe()).toMatchObject({
+        error: null,
+        sessions: [{ error: null }],
+      });
+      h.advance(15_000);
+      await h.flush();
+      expect(starts(h.client)).toHaveLength(1);
+      expect(h.client.characters.get('npc_1')?.animation).toBeNull();
+    },
+  );
+
+  test('failed clears retry without blocking movement and status', async () => {
+    const h = setup({ characterConfig: character });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    h.advance(15_000);
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockRejectedValueOnce(new NpcError('clear_timeout', true));
+    await h.flush();
+    h.observe('PermissionRequest', { tool_name: 'Bash' });
+    await h.flush();
+    expect(h.client.characters.get('npc_1')?.location).toMatchObject({
+      type: 'user',
+    });
+    expect(h.coordinator.describe()).toMatchObject({
+      error: null,
+      sessions: [{ error: null, animation: { error: 'clear_timeout' } }],
+    });
+    h.advance(1000);
+    await h.flush();
+    expect(starts(h.client).at(-1)).toEqual({
+      clip: 'reactSurprise',
+      mode: 'loop',
+      durationSeconds: 14,
+    });
+  });
+
+  test('restart clears even when disabled, waits for acknowledgment, and does not replay reactions', async () => {
+    const h = setup({ characterConfig: character });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    const before = h.client.writes.length;
+    const recovered = setup({ ...h.options, animationsEnabled: false });
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockRejectedValueOnce(new NpcError('hide_timeout', true));
+    recovered.observe('UserPromptSubmit', { session_id: 'new' });
+    await recovered.flush();
+    expect(recovered.coordinator.describe()).toMatchObject({
+      startupHidesPending: 1,
+    });
+    expect(h.client.writes).toHaveLength(before);
+    h.advance(1000);
+    await recovered.flush(6);
+    expect(h.client.writes[before]?.patch).toEqual({
+      visible: false,
+      textStatus: null,
+      say: null,
+      animation: null,
+    });
+    expect(h.client.characters.get('npc_1')).toMatchObject({
+      visible: true,
+      animation: null,
+    });
+    expect(starts(h.client)).toHaveLength(1);
+    expect(h.client.npcs.getNpcAnimations).toHaveBeenCalledTimes(1);
+    await recovered.coordinator.stop();
+  });
+
+  test('a delayed start cannot cross pool reassignment, and hide clears before reuse', async () => {
+    const h = setup({ characterConfig: character, maxSessions: 1 });
+    h.observe('UserPromptSubmit');
+    await h.flush();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const update = jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .getMockImplementation()!;
+    jest
+      .spyOn(h.client.npcs, 'updateNpc')
+      .mockImplementation(async (id, patch) => {
+        if (patch.animation?.clip === 'reactSurprise') {
+          entered.resolve();
+          await release.promise;
+        }
+        return update(id, patch);
+      });
+    h.observe('PermissionRequest', { tool_name: 'Bash' });
+    await h.coordinator.tick(); // State first.
+    await h.coordinator.tick(); // Cancel old reaction.
+    const publishing = h.coordinator.tick();
+    await entered.promise;
+    h.observe('SessionEnd');
+    h.observe('UserPromptSubmit', { session_id: 'replacement' }, 'claude');
+    await h.coordinator.tick();
+    expect(h.client.creates).toBe(1);
+    expect(h.client.characters.get('npc_1')?.name).toBe("Jesse's Codex 1");
+    release.resolve();
+    await publishing;
+    await h.flush(6);
+    const hide = h.client.writes.findIndex(
+      ({ patch }) => patch.visible === false,
+    );
+    expect(h.client.writes[hide]?.patch.animation).toBeNull();
+    expect(h.client.writes[hide + 1]?.patch.name).toBe("Jesse's Claude 1");
+    expect(h.client.creates).toBe(1);
+    expect(h.client.npcs.getNpcAnimations).toHaveBeenCalledTimes(1);
+    await h.coordinator.stop();
+    expect(h.client.writes.at(-1)?.patch).toEqual({
+      visible: false,
+      textStatus: null,
+      say: null,
+      animation: null,
+    });
+  });
+});
 
 describe('NPC coordination', () => {
   test('without an override, new NPCs inherit the owner and appearance is not patched', async () => {
@@ -276,6 +798,7 @@ describe('NPC coordination', () => {
       visible: false,
       say: null,
       textStatus: null,
+      animation: null,
     });
     expect(startupWrites[1]?.patch).toMatchObject({
       visible: true,

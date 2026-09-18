@@ -113,6 +113,7 @@ const npcs = config.npcEnabled
           : `${config.soworkBaseUrl || 'https://api.sowork.com/public'}\0${config.soworkApiKey}`,
       ),
       namePrefix: config.npcNamePrefix,
+      animationsEnabled: config.npcAnimationsEnabled,
       characterConfig: parseNpcCharacterConfig(config.npcCharacterConfig),
       idleMinutes: config.npcIdleMinutes,
       staleMinutes: config.npcStaleMinutes,

@@ -160,6 +160,65 @@ describe('NPC input privacy and identity', () => {
 });
 
 describe('NPC lifecycle reducer', () => {
+  test('reactions follow lifecycle revisions, not tools, children, or compaction', () => {
+    const current = session();
+    const working = current.reaction;
+    expect(working).toMatchObject({
+      clip: 'reactThink',
+      expiresAt: NOW + 15_000,
+    });
+    for (const event of [
+      signal('PreToolUse', { tool_name: 'Bash', tool_use_id: 'command' }),
+      signal('PostToolUse', { tool_name: 'Bash', tool_use_id: 'command' }),
+      signal('Stop', { agent_id: 'child' }),
+      signal('SessionStart', { source: 'compact' }),
+      signal('PreToolUse', { tool_name: 'functions.request_user_input_async' }),
+      signal('UserPromptSubmit', { turn_id: 'turn-1' }),
+    ]) {
+      current.apply(event);
+      expect(current.reaction).toBe(working);
+    }
+    current.apply(
+      signal('UserPromptSubmit', { turn_id: 'turn-2' }, NOW + 2000),
+    );
+    expect(current.reaction).not.toBe(working);
+    expect(current.reaction?.expiresAt).toBe(NOW + 17_000);
+    current.apply(signal('Stop', { turn_id: 'turn-1' }, NOW + 3000));
+    expect(current.reaction?.clip).toBe('reactThink');
+    current.apply(signal('Stop', { turn_id: 'turn-2' }, NOW + 3000));
+    const finished = current.reaction;
+    current.apply(signal('Stop', { turn_id: 'turn-2' }, NOW + 4000));
+    expect(current.reaction).toBe(finished);
+    expect(finished).toMatchObject({
+      clip: 'reactCelebrate',
+      expiresAt: NOW + 18_000,
+    });
+    current.expire(NOW + 17_999, 600_000, 7_200_000);
+    expect(current.reaction).toBe(finished);
+    current.expire(NOW + 18_000, 600_000, 7_200_000);
+    expect(current.reaction).toBeUndefined();
+    current.apply(signal('Stop', {}, NOW + 19_000));
+    expect(current.reaction).toBeUndefined();
+  });
+
+  test('hiding cancels a reaction and fresh activity creates a new one', () => {
+    const current = session();
+    current.hide(NOW + 1000);
+    expect(current.reaction).toBeUndefined();
+    current.apply(signal('PostToolUse', { tool_name: 'Bash' }, NOW + 2000));
+    expect(current.reaction).toMatchObject({
+      clip: 'reactThink',
+      expiresAt: NOW + 17_000,
+    });
+    current.apply(signal('Interrupt', {}, NOW + 3000));
+    expect(current.reaction).toBeUndefined();
+    current.apply(
+      signal('UserPromptSubmit', { turn_id: 'turn-2' }, NOW + 4000),
+    );
+    current.apply(signal('SessionEnd', {}, NOW + 4001));
+    expect(current.reaction).toBeUndefined();
+  });
+
   test('textless stop finishes a turn, and only SessionEnd ends its session', () => {
     const current = session();
     current.apply(signal('Stop', { turn_id: 'turn-1' }, NOW + 1000));

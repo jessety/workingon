@@ -1,4 +1,8 @@
-import type { NpcCharacterConfiguration } from 'sowork';
+import type {
+  NpcAnimationCatalog,
+  NpcCharacterConfiguration,
+  SoWork,
+} from 'sowork';
 import type { ActivitySource } from '../activity/events.js';
 
 export type SessionKind =
@@ -56,6 +60,16 @@ export interface SessionSummarizer {
 
 export type NpcLocation = { type: 'desk' } | { type: 'user'; userId: string };
 
+export type NpcAnimation = NonNullable<
+  Parameters<SoWork['npcs']['updateNpc']>[1]['animation']
+>;
+
+export interface SessionReaction {
+  clip: NpcAnimation['clip'];
+  revision: number;
+  expiresAt: number;
+}
+
 export interface Npc {
   id: string;
   ownerId: string;
@@ -71,6 +85,7 @@ export interface NpcPatch {
   location?: NpcLocation;
   textStatus?: string | null;
   say?: { text: string } | null;
+  animation?: NpcAnimation | null;
 }
 
 /** The SDK satisfies this slice structurally; tests supply an in-memory client. */
@@ -90,6 +105,7 @@ export interface NpcClient {
       data: { npcs: Npc[]; nextCursor?: string };
     }>;
     getNpc(id: string): Promise<{ data: Npc }>;
+    getNpcAnimations(id: string): Promise<{ data: NpcAnimationCatalog }>;
     updateNpc(id: string, patch: NpcPatch): Promise<unknown>;
     deleteNpc(id: string): Promise<unknown>;
   };
