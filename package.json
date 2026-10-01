@@ -51,7 +51,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "env-smart": "^2.3.2",
-    "sowork": "^0.3.0"
+    "sowork": "^0.7.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
