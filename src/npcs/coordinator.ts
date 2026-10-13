@@ -20,6 +20,8 @@ import type {
 } from './types.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 
+const PRESENCE_INTERVAL_MS = 30_000;
+
 export interface NpcOptions {
   client: NpcClient;
   repository: NpcStateRepository;
@@ -383,6 +385,28 @@ export class NpcCoordinator implements SessionSink {
     return action();
   }
 
+  /** A failed identity read is safe to retry; it cannot create or mutate an NPC. */
+  async #readMe(): ReturnType<NpcClient['me']['getMe']> {
+    return this.#request(async () => {
+      try {
+        return await this.#options.client.me.getMe();
+      } catch (error) {
+        const failure = npcError(error, this.#now());
+        const authenticationFailure =
+          failure.status === 401 || failure.status === 403;
+
+        // A 404 from this endpoint does not prove an ownership change. Keep
+        // this policy local to GET /me: create/update errors have other rules.
+        throw new NpcError(
+          failure.code,
+          !authenticationFailure,
+          failure.retryAfterMs,
+          failure.status,
+        );
+      }
+    });
+  }
+
   async #initialize(): Promise<void> {
     if (!this.#opened) {
       try {
@@ -400,9 +424,7 @@ export class NpcCoordinator implements SessionSink {
     if (this.#stopping) {
       return;
     }
-    const { data: me } = await this.#request(() =>
-      this.#options.client.me.getMe(),
-    );
+    const { data: me } = await this.#readMe();
     if (typeof me.id !== 'string' || me.id === '' || me.id.length > 256) {
       throw new NpcError('npc_invalid_owner', false);
     }
@@ -450,7 +472,7 @@ export class NpcCoordinator implements SessionSink {
     }
     this.#ready = true;
     this.#initializationError = undefined;
-    this.#presenceAt = now + 30_000;
+    this.#presenceAt = now + PRESENCE_INTERVAL_MS;
     const pending = this.#pending;
     this.#pending = [];
     for (const signal of pending) {
@@ -467,6 +489,54 @@ export class NpcCoordinator implements SessionSink {
       Math.min(60_000, 1000 * 2 ** Math.min(failures - 1, 6)) *
         (1 + this.#random() * 0.2),
     );
+  }
+
+  /** Presence is optional after identity verification; failures retain availability. */
+  async #refreshPresence(): Promise<void> {
+    try {
+      const { data: me } = await this.#readMe();
+
+      if (me.id !== this.#state?.ownerId) {
+        throw new NpcError('npc_owner_changed', false);
+      }
+
+      this.#ownerOnline = me.presence.availability !== 'offline';
+
+      if (this.#presenceError !== undefined) {
+        log.info('NPC presence refresh recovered');
+      }
+
+      this.#presenceError = undefined;
+    } catch (error) {
+      const failure = npcError(error, this.#now());
+      this.#presenceError = failure.code;
+
+      if (!failure.retryable) {
+        this.#fatal = failure.code;
+        log.error(
+          'NPC publishing paused: presence identity or authentication check failed',
+          failure.code,
+        );
+        return;
+      }
+
+      // Wait a full polling interval after failure, including slow requests.
+      // Rate limits also pause other API work, without rejecting incoming hooks.
+      const retryInMs = Math.max(PRESENCE_INTERVAL_MS, failure.retryAfterMs);
+      this.#presenceAt = this.#now() + retryInMs;
+
+      if (failure.status === 429) {
+        this.#apiBlockedUntil = Math.max(
+          this.#apiBlockedUntil,
+          this.#presenceAt,
+        );
+      }
+
+      log.warn(
+        'NPC presence refresh failed; retaining last known availability and retrying',
+        { code: failure.code, retryInMs },
+      );
+    }
   }
 
   /** Starts available work; overlapping pulses share per-session/global limits. */
@@ -557,31 +627,11 @@ export class NpcCoordinator implements SessionSink {
     ) {
       this.#presenceRunning = true;
       this.#apiCount += 1;
-      this.#presenceAt = now + 30_000;
+      this.#presenceAt = now + PRESENCE_INTERVAL_MS;
       jobs.push(
         this.#job(async () => {
           try {
-            const { data: me } = await this.#request(() =>
-              this.#options.client.me.getMe(),
-            );
-            if (me.id !== this.#state?.ownerId) {
-              throw new NpcError('npc_owner_changed', false);
-            }
-            this.#ownerOnline = me.presence.availability !== 'offline';
-            this.#presenceError = undefined;
-          } catch (error) {
-            const failure = npcError(error, this.#now());
-            this.#presenceError = failure.code;
-            if (!failure.retryable) {
-              this.#fatal = failure.code;
-            } else if (failure.status === 429) {
-              this.#apiBlockedUntil =
-                this.#now() + Math.max(30_000, failure.retryAfterMs);
-            }
-            log.warn(
-              'NPC presence refresh failed; retaining the last known location',
-              failure.code,
-            );
+            await this.#refreshPresence();
           } finally {
             this.#presenceRunning = false;
             this.#apiCount -= 1;
