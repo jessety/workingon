@@ -1,4 +1,6 @@
+import envSmart from 'env-smart';
 import { validate, type Configuration } from '../src/config.js';
+import { parseNpcCharacterConfig } from '../src/npcs/character.js';
 
 function configuration(overrides: Partial<Configuration> = {}): Configuration {
   return {
@@ -18,6 +20,16 @@ function configuration(overrides: Partial<Configuration> = {}): Configuration {
     planDirectory: '',
     planMaxAgeHours: 12,
     planContextChars: 400,
+    npcEnabled: false,
+    npcAnimationsEnabled: true,
+    npcNamePrefix: '',
+    npcCharacterConfig: '',
+    npcIdleMinutes: 10,
+    npcStaleMinutes: 120,
+    npcSummaryIntervalSeconds: 30,
+    npcSpeechCooldownSeconds: 60,
+    npcMaxSessions: 50,
+    npcStateFile: '/tmp/workingon-test-npcs.json',
     dryRun: false,
     verbose: false,
     ...overrides,
@@ -59,5 +71,117 @@ describe('validate', () => {
     expect(
       problems.some((problem) => problem.includes('ANTHROPIC_API_KEY')),
     ).toBe(true);
+  });
+
+  test('NPC mode needs SoWork credentials even when Slack is configured', () => {
+    expect(
+      validate(configuration({ npcEnabled: true, slackApiToken: 'xoxp-x' })),
+    ).toContain('NPC_ENABLED requires SOWORK_API_KEY (or DRY_RUN=TRUE)');
+  });
+
+  test('NPC dry run can operate without a SoWork key', () => {
+    expect(validate(configuration({ npcEnabled: true, dryRun: true }))).toEqual(
+      [],
+    );
+  });
+
+  test.each(['', '   '])(
+    'empty character override uses the API default: %p',
+    (raw) => {
+      expect(parseNpcCharacterConfig(raw)).toBeUndefined();
+    },
+  );
+
+  test.each(['', "'", '"'])(
+    'reads character JSON through env-smart with %p wrapping quotes',
+    (quote) => {
+      const character = {
+        version: 5,
+        bodyType: 'example-body',
+        slots: { hair: 'example-hair', shirt: 'example-shirt' },
+      };
+      const parsed = envSmart.parse(
+        `NPC_CHARACTER_CONFIG=${quote}${JSON.stringify(character)}${quote}`,
+      );
+      const raw = parsed.NPC_CHARACTER_CONFIG as string;
+      expect(parseNpcCharacterConfig(raw)).toEqual(character);
+      expect(
+        validate(
+          configuration({
+            npcEnabled: true,
+            dryRun: true,
+            npcCharacterConfig: raw,
+          }),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  test.each([
+    '{"secret":"do-not-log"',
+    'null',
+    '[]',
+    'false',
+    '{}',
+    '{"version":4,"bodyType":"body","slots":{}}',
+    '{"version":5,"bodyType":"","slots":{}}',
+    '{"version":5,"bodyType":42,"slots":{}}',
+    '{"version":5,"bodyType":"body","slots":[]}',
+    '{"version":5,"bodyType":"body","slots":{"hair":42}}',
+    '{"version":5,"bodyType":"body","slots":{"hair":null}}',
+    '{"version":5,"bodyType":"body","slots":{},"secret":"do-not-log"}',
+  ])(
+    'rejects malformed character overrides without echoing input: %p',
+    (raw) => {
+      const problems = validate(
+        configuration({
+          npcEnabled: true,
+          dryRun: true,
+          npcCharacterConfig: raw,
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain('NPC_CHARACTER_CONFIG');
+      expect(problems[0]).not.toContain('do-not-log');
+    },
+  );
+
+  test('an unused character override does not prevent personal statuses', () => {
+    expect(
+      validate(
+        configuration({
+          soworkApiKey: 'sw_x',
+          npcCharacterConfig: 'invalid',
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test.each([NaN, Infinity, 0, -1])(
+    'rejects invalid NPC timing: %p',
+    (value) => {
+      expect(
+        validate(
+          configuration({
+            npcEnabled: true,
+            dryRun: true,
+            npcIdleMinutes: value,
+          }),
+        ).some((message) => message.startsWith('NPC_IDLE_MINUTES')),
+      ).toBe(true);
+    },
+  );
+
+  test('validates capacity, state path, and a stale timeout shorter than idle', () => {
+    const problems = validate(
+      configuration({
+        npcEnabled: true,
+        dryRun: true,
+        npcMaxSessions: 1.5,
+        npcStateFile: '',
+        npcStaleMinutes: 1,
+      }),
+    );
+    expect(problems).toHaveLength(3);
   });
 });

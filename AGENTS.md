@@ -20,6 +20,8 @@ npm run start:pm2      # how it actually runs day to day
 
 Running it needs `.env` with `ANTHROPIC_API_KEY` plus at least one of `SOWORK_API_KEY` / `SLACK_API_TOKEN`. Set `DRY_RUN=TRUE` to summarize and log without writing anywhere, and `VERBOSE=TRUE` to log every hook as it arrives. Under pm2, logs split across `~/.pm2/logs/workingon-{out,error}.log` — **`log.warn` and `log.error` go to the error file**, which is easy to miss when debugging.
 
+The lint script pins the EditorConfig core binary to v3.11.3. The npm wrapper expects `ec-*` assets, which were renamed in [core v4](https://github.com/editorconfig-checker/editorconfig-checker/releases/tag/v4.0.0); downloading `latest` breaks a clean install.
+
 ## Architecture
 
 Coding agents POST hook events to a local HTTP server. Each input normalizes its events into one neutral shape (`ActivityEvent`), held in a fixed-size in-memory ring buffer; every N minutes an interval turns the window into a text digest, sends it to the Anthropic API for a one-line summary, and broadcasts that to every configured output.
@@ -82,3 +84,21 @@ Tests use `ts-jest` in CJS mode with a `moduleNameMapper` stripping `.js`, so no
 The runtime dependencies are deliberately few — `@anthropic-ai/sdk`, `sowork`, `env-smart`. The last two are CommonJS and interop through Node's named-export detection.
 
 Config is typed via `env-smart` in `src/config.ts`, with defaults in `.env.defaults` and types in `.env.types` (both committed; `.env` is not). Adding a setting means touching all three.
+
+## NPC companions
+
+NPC mode is optional (`NPC_ENABLED=FALSE` by default). `Input.normalizeSession()` produces a separate sanitized `SessionSignal`; the original personal activity digest and prompt retain their provenance rules. The NPC coordinator in `src/npcs/` implements a synchronous memory-only hook sink, with publishing, persistence, and summarization in background workers.
+
+NPC identity is keyed by source plus a hash of the session ID, not by project. Helpers contribute to their parent's context; their stops must never terminate a main session. Lifecycle state is determined by the reducer, never the summarizing model. Keep optional turn/tool identifiers for stale-event rejection and deduplication without sending them to Anthropic or SoWork.
+
+The ownership ledger is the deliberate exception to in-memory-only storage: metadata only, no activity/prose. A creation intent must be durable before POST, and the returned NPC ID durable before a visible PATCH. An ambiguous create is recovered through its exact temporary name plus owner; never blindly retry or adopt/delete NPCs by their display-name prefix. Corrupt/inaccessible state fails closed for the NPC lane. Dry run must not access the live ledger or construct a live SoWork client.
+
+Every restored NPC must acknowledge an explicit hide-and-clear PATCH before reuse, even when fresh hooks arrive during startup. Keep this recovery requirement separate from the desired session visibility so new activity cannot bypass it.
+
+Physical NPCs form one user-level pool across this machine, shared by providers and repositories. Sessions lease the lowest available numbered slot; release must hide and clear successfully before reassignment. Never delete pooled NPCs on end or inactivity. Keep session history bounded independently of pool capacity, and reject stale summary results across reassignment. Explicit `waiting-input` and `waiting-permission` states follow the online owner. Queued asynchronous questions do not block the agent and must not create a waiting state. Each completed response gets one 30-second review visit and a deterministic “Ready for review” bubble, then returns to the desk. Duplicate finishes never extend the memory-only timer; new work cancels it and new input requests take precedence. Review announcements bypass ordinary speech cooldowns, but are never replayed after ambiguous writes or restart. Working, ready, interrupted, and failed sessions belong at the desk. Both locations retain the existing hide timeouts. Version 1 ledgers require an explicit ownership-verified reset, never automatic discarding or adoption.
+
+See `docs/npcs.md` for setup and recovery behavior.
+
+`NPC_CHARACTER_CONFIG` is optional complete v5 JSON, typed from the SoWork SDK. Asset IDs are validated by SoWork, not inferred from prose. Before applying an override, save the owned NPC's original character configuration in its ledger slot; clearing the setting restores that snapshot. New characters inherit the owner while hidden before receiving the override. Appearance changes must preserve startup hide acknowledgments and durable ownership ordering, and must not be resent with every status/location PATCH. A missing/replaced NPC invalidates its saved original appearance.
+
+`NPC_ANIMATIONS_ENABLED` defaults to true within NPC mode. Reactions are deterministic, memory-only 15-second windows from lifecycle hooks: working → `reactThink`, blocking input/permission → `reactSurprise`, finished → `reactCelebrate`, failed → `reactCry`. Ordinary tools, duplicates, summaries, and compaction must not restart them. Only `characterA` plus catalog-advertised loop support is eligible. Publish starts separately from normal desired-state PATCHes, after appearance/movement/speech, and consume attempted starts even on ambiguous failure. Recheck lifecycle and deadline after async lookups. Animation failures stay isolated; startup, release, and shutdown must acknowledge `animation:null` with hiding, even when reactions are disabled. No animation timers or capabilities belong in the ledger.

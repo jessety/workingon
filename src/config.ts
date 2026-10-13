@@ -1,4 +1,5 @@
 import envSmart from 'env-smart';
+import { parseNpcCharacterConfig } from './npcs/character.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -74,6 +75,21 @@ export interface Configuration {
   /** Cap on how much of a plan's Context section is sent to the Anthropic API */
   planContextChars: number;
 
+  /** Optional per-session NPC companions, independent of personal statuses. */
+  npcEnabled: boolean;
+  npcAnimationsEnabled: boolean;
+  npcNamePrefix: string;
+  /** Optional JSON matching the SoWork SDK's NpcCharacterConfiguration. */
+  npcCharacterConfig: string;
+  npcIdleMinutes: number;
+  npcStaleMinutes: number;
+  npcSummaryIntervalSeconds: number;
+  npcSpeechCooldownSeconds: number;
+  /** Shared physical pool and concurrent lease limit, independent of session history. */
+  npcMaxSessions: number;
+  /** One user-level ownership ledger shared by every checkout on this machine. */
+  npcStateFile: string;
+
   /** Summarize and log, but never write a status anywhere */
   dryRun: boolean;
   /** Log every hook event as it arrives */
@@ -103,6 +119,17 @@ export const config = envSmart.config<Configuration>((env) => ({
   planDirectory: expandHome(env.PLAN_DIRECTORY as string),
   planMaxAgeHours: env.PLAN_MAX_AGE_HOURS as number,
   planContextChars: env.PLAN_CONTEXT_CHARS as number,
+
+  npcEnabled: env.NPC_ENABLED as boolean,
+  npcAnimationsEnabled: env.NPC_ANIMATIONS_ENABLED as boolean,
+  npcNamePrefix: env.NPC_NAME_PREFIX as string,
+  npcCharacterConfig: env.NPC_CHARACTER_CONFIG as string,
+  npcIdleMinutes: env.NPC_IDLE_MINUTES as number,
+  npcStaleMinutes: env.NPC_STALE_MINUTES as number,
+  npcSummaryIntervalSeconds: env.NPC_SUMMARY_INTERVAL_SECONDS as number,
+  npcSpeechCooldownSeconds: env.NPC_SPEECH_COOLDOWN_SECONDS as number,
+  npcMaxSessions: env.NPC_MAX_SESSIONS as number,
+  npcStateFile: expandHome(env.NPC_STATE_FILE as string),
 
   dryRun: env.DRY_RUN as boolean,
   verbose: env.VERBOSE as boolean,
@@ -142,6 +169,43 @@ export function validate(configuration: Configuration): string[] {
   ) {
     // SoWork caps textStatus at 256 characters
     problems.push('SUMMARY_MAX_LENGTH must be between 1 and 256');
+  }
+
+  if (configuration.npcEnabled) {
+    try {
+      parseNpcCharacterConfig(configuration.npcCharacterConfig);
+    } catch (error) {
+      problems.push((error as Error).message);
+    }
+    if (!configuration.dryRun && configuration.soworkApiKey === '') {
+      problems.push('NPC_ENABLED requires SOWORK_API_KEY (or DRY_RUN=TRUE)');
+    }
+    const positive = [
+      ['NPC_IDLE_MINUTES', configuration.npcIdleMinutes],
+      ['NPC_STALE_MINUTES', configuration.npcStaleMinutes],
+      ['NPC_SUMMARY_INTERVAL_SECONDS', configuration.npcSummaryIntervalSeconds],
+      ['NPC_SPEECH_COOLDOWN_SECONDS', configuration.npcSpeechCooldownSeconds],
+    ] as const;
+    for (const [name, value] of positive) {
+      if (!Number.isFinite(value) || value <= 0 || value > 1_000_000) {
+        problems.push(
+          `${name} must be a positive finite number no greater than 1000000`,
+        );
+      }
+    }
+    if (configuration.npcStaleMinutes < configuration.npcIdleMinutes) {
+      problems.push('NPC_STALE_MINUTES must be at least NPC_IDLE_MINUTES');
+    }
+    if (
+      !Number.isSafeInteger(configuration.npcMaxSessions) ||
+      configuration.npcMaxSessions < 1 ||
+      configuration.npcMaxSessions > 1000
+    ) {
+      problems.push('NPC_MAX_SESSIONS must be an integer between 1 and 1000');
+    }
+    if (configuration.npcStateFile.trim() === '') {
+      problems.push('NPC_STATE_FILE must be a non-empty path');
+    }
   }
 
   return problems;

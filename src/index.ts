@@ -1,7 +1,13 @@
 import { PlanIndex } from './activity/plans.js';
 import { ActivityStore } from './activity/store.js';
 import { config, validate } from './config.js';
+import { identity } from './inputs/session.js';
 import { describeError, log, setVerbose } from './logger.js';
+import { parseNpcCharacterConfig } from './npcs/character.js';
+import { createNpcClient, DryRunNpcClient } from './npcs/client.js';
+import { NpcCoordinator } from './npcs/coordinator.js';
+import { FileNpcState, MemoryNpcState } from './npcs/state.js';
+import { NpcSummarizer } from './npcs/summarize.js';
 import { Broadcast } from './outputs/broadcast.js';
 import { SlackStatus } from './outputs/slack.js';
 import { PresenceUpdater } from './outputs/sowork.js';
@@ -89,10 +95,39 @@ const scheduler = new Scheduler({
   idleClearMinutes: config.idleClearMinutes,
 });
 
+const npcs = config.npcEnabled
+  ? new NpcCoordinator({
+      client: config.dryRun
+        ? new DryRunNpcClient()
+        : createNpcClient(config.soworkApiKey, config.soworkBaseUrl),
+      repository: config.dryRun
+        ? new MemoryNpcState()
+        : new FileNpcState(config.npcStateFile),
+      summarizer: new NpcSummarizer({
+        apiKey: config.anthropicApiKey,
+        model: config.anthropicModel,
+      }),
+      account: identity(
+        config.dryRun
+          ? 'dry-run'
+          : `${config.soworkBaseUrl || 'https://api.sowork.com/public'}\0${config.soworkApiKey}`,
+      ),
+      namePrefix: config.npcNamePrefix,
+      animationsEnabled: config.npcAnimationsEnabled,
+      characterConfig: parseNpcCharacterConfig(config.npcCharacterConfig),
+      idleMinutes: config.npcIdleMinutes,
+      staleMinutes: config.npcStaleMinutes,
+      summaryIntervalSeconds: config.npcSummaryIntervalSeconds,
+      speechCooldownSeconds: config.npcSpeechCooldownSeconds,
+      maxSessions: config.npcMaxSessions,
+    })
+  : undefined;
+
 const server = createServer({
   port: config.port,
   token: config.hookToken,
   store,
+  sessions: npcs,
   describeStatus: () =>
     Object.fromEntries(
       Object.entries(states).map(([name, state]) => [name, state()]),
@@ -116,6 +151,7 @@ server.listen(config.port, config.host, () => {
   }
 
   scheduler.start();
+  npcs?.start();
 });
 
 server.on('error', (error) => {
@@ -133,7 +169,10 @@ function shutdown(signal: string): void {
 
   log.info(`Received ${signal}, shutting down`);
   scheduler.stop();
-  server.close(() => process.exit(0));
+  const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+  void Promise.allSettled([closed, npcs?.stop() ?? Promise.resolve()]).then(
+    () => process.exit(0),
+  );
 
   // Don't wait forever on lingering keep-alive connections
   setTimeout(() => process.exit(0), 5_000).unref();

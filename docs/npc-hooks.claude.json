@@ -1,0 +1,141 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS -m 5 -X POST http://127.0.0.1:8220/hooks/claude -H \"Content-Type: application/json\" -H \"Authorization: Bearer $WORKINGON_HOOK_TOKEN\" --data-binary @- >/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8220/hooks/claude",
+            "headers": {
+              "Authorization": "Bearer $WORKINGON_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["WORKINGON_HOOK_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
